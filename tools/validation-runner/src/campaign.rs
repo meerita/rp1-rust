@@ -139,23 +139,22 @@ pub fn definition() -> Vec<SegmentDefinition> {
                 Step::new("cargo", &["package", "--package", "rp1db"]),
             ],
         },
+        SegmentDefinition {
+            id: "no-internal-references",
+            purpose: "no tracked file cites internal working material",
+            tiers: &[Tier::Dev, Tier::Gate],
+            prerequisite: None,
+            steps: vec![Step::new("/bin/sh", &["-c", INTERNAL_REFERENCE_SCAN])],
+        },
+        SegmentDefinition {
+            id: "docs",
+            purpose: "the documentation builds and its links resolve",
+            tiers: &[Tier::Dev, Tier::Gate],
+            prerequisite: None,
+            steps: vec![Step::new("cargo", &["doc", "--no-deps", "--workspace"])],
+        },
     ]
 }
-
-/// Asserts the package file list rather than leaving it to be read by eye.
-///
-/// The manifest uses an include allowlist, so an internal path cannot enter
-/// the package by accident. This segment proves that, and proves that both
-/// license files ship with the crate.
-const PACKAGE_CONTENTS_CHECK: &str = concat!(
-    "list=$(cargo package --list --package rp1db) || exit 1; ",
-    "if printf '%s\\n' \"$list\" | grep -qE ",
-    "'^(AGENTS[.]md|CLAUDE[.]md|[.]agents/|[.]claude/|probes/|runs/|foundation/|tmp/)'; ",
-    "then echo 'the package carries an internal path'; exit 1; fi; ",
-    "for required in Cargo.toml README.md LICENSE-MIT LICENSE-APACHE src/lib.rs; do ",
-    "if ! printf '%s\\n' \"$list\" | grep -qx \"$required\"; ",
-    "then echo \"the package is missing $required\"; exit 1; fi; done"
-);
 
 /// Fails when a tracked manifest declares a path dependency that leaves the
 /// repository. A dependency outside the checkout cannot be resolved from a
@@ -165,6 +164,42 @@ const LOCAL_PATH_CHECK: &str = concat!(
     "'path[[:space:]]*=[[:space:]]*\"[^\"]*[.][.]'; then ",
     "echo 'a manifest declares a path dependency that leaves the repository'; ",
     "exit 1; fi"
+);
+
+/// Asserts the package file list rather than leaving it to be read by eye.
+///
+/// The manifest uses an include allowlist, so an internal path cannot enter
+/// the package by accident. This segment proves that, and proves that both
+/// license files ship with the crate.
+const PACKAGE_CONTENTS_CHECK: &str = concat!(
+    "list=$(cargo package --list --package rp1db) || exit 1; ",
+    "unexpected=$(printf '%s\\n' \"$list\" | grep -vE ",
+    "'^([.]cargo_vcs_info[.]json|Cargo[.]toml|Cargo[.]toml[.]orig|Cargo[.]lock",
+    "|LICENSE-(MIT|APACHE)|README[.]md|CHANGELOG[.]md|src/.*[.]rs)$'); ",
+    "if [ -n \"$unexpected\" ]; then ",
+    "echo 'the package carries files the allowlist does not name:'; ",
+    "printf '%s\\n' \"$unexpected\"; exit 1; fi; ",
+    "for required in Cargo.toml README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE src/lib.rs; do ",
+    "if ! printf '%s\\n' \"$list\" | grep -qx \"$required\"; ",
+    "then echo \"the package is missing $required\"; exit 1; fi; done"
+);
+
+/// Fails when a tracked file cites an internal working path, a numbered
+/// internal document, or an internal workflow step.
+///
+/// Two tracked files are excluded and both have to be. The ignore file
+/// names every path it excludes from the repository, and this file names
+/// the patterns it forbids. Nothing else is exempt.
+const INTERNAL_REFERENCE_SCAN: &str = concat!(
+    "files=$(git ls-files | grep -vE ",
+    "'^([.]gitignore|tools/validation-runner/src/campaign[.]rs)$'); ",
+    "hits=$(printf '%s\\n' \"$files\" | xargs grep -InE ",
+    "'(AGENTS[.]md|CLAUDE[.]md|[.]agents/|[.]claude/|probes/|runs/|foundation/|tmp/",
+    "|[Rr]ule [0-9]|/(investigate|plan-authoring|implement|definition-of-done",
+    "|pr-check|pr-review|pr-merge))' /dev/null); ",
+    "if [ -n \"$hits\" ]; then ",
+    "echo 'a tracked file cites internal working material:'; ",
+    "printf '%s\\n' \"$hits\"; exit 1; fi"
 );
 
 /// The segments a tier requires, in execution order.
@@ -838,7 +873,17 @@ mod tests {
             .map(SegmentDefinition::id)
             .collect();
 
-        assert_eq!(dev, vec!["build-and-lint", "unit-tests", "msrv", "deps"]);
+        assert_eq!(
+            dev,
+            vec![
+                "build-and-lint",
+                "unit-tests",
+                "msrv",
+                "deps",
+                "no-internal-references",
+                "docs"
+            ]
+        );
 
         let gate: Vec<&str> = required(Tier::Gate)
             .iter()
@@ -852,7 +897,9 @@ mod tests {
                 "unit-tests",
                 "msrv",
                 "deps",
-                "package-contents"
+                "package-contents",
+                "no-internal-references",
+                "docs"
             ]
         );
     }
