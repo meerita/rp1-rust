@@ -129,8 +129,33 @@ pub fn definition() -> Vec<SegmentDefinition> {
                 Step::new("/bin/sh", &["-c", LOCAL_PATH_CHECK]),
             ],
         },
+        SegmentDefinition {
+            id: "package-contents",
+            purpose: "the published package carries the intended files and nothing else",
+            tiers: &[Tier::Gate],
+            prerequisite: None,
+            steps: vec![
+                Step::new("/bin/sh", &["-c", PACKAGE_CONTENTS_CHECK]),
+                Step::new("cargo", &["package", "--package", "rp1db"]),
+            ],
+        },
     ]
 }
+
+/// Asserts the package file list rather than leaving it to be read by eye.
+///
+/// The manifest uses an include allowlist, so an internal path cannot enter
+/// the package by accident. This segment proves that, and proves that both
+/// license files ship with the crate.
+const PACKAGE_CONTENTS_CHECK: &str = concat!(
+    "list=$(cargo package --list --package rp1db) || exit 1; ",
+    "if printf '%s\\n' \"$list\" | grep -qE ",
+    "'^(AGENTS[.]md|CLAUDE[.]md|[.]agents/|[.]claude/|probes/|runs/|foundation/|tmp/)'; ",
+    "then echo 'the package carries an internal path'; exit 1; fi; ",
+    "for required in Cargo.toml README.md LICENSE-MIT LICENSE-APACHE src/lib.rs; do ",
+    "if ! printf '%s\\n' \"$list\" | grep -qx \"$required\"; ",
+    "then echo \"the package is missing $required\"; exit 1; fi; done"
+);
 
 /// Fails when a tracked manifest declares a path dependency that leaves the
 /// repository. A dependency outside the checkout cannot be resolved from a
@@ -820,7 +845,16 @@ mod tests {
             .map(SegmentDefinition::id)
             .collect();
 
-        assert_eq!(gate, vec!["build-and-lint", "unit-tests", "msrv", "deps"]);
+        assert_eq!(
+            gate,
+            vec![
+                "build-and-lint",
+                "unit-tests",
+                "msrv",
+                "deps",
+                "package-contents"
+            ]
+        );
     }
 
     #[test]
