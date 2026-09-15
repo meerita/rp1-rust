@@ -1,0 +1,47 @@
+# Dependency and supply-chain policy for this repository.
+#
+# The published crate offers MIT OR Apache-2.0. Every dependency it carries
+# must be usable under both halves of that offer, must come from the public
+# crates.io registry, and must not arrive from a Git source.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# The crate carries no dependencies yet, so most allowances match nothing.
+# An unmatched allowance is not a policy failure.
+unused-allowed-license = "allow"
+# Permissive licenses that a crate published under MIT OR Apache-2.0 can
+# carry. A copyleft or unknown license stops the audit.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
