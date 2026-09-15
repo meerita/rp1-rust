@@ -153,8 +153,43 @@ pub fn definition() -> Vec<SegmentDefinition> {
             prerequisite: None,
             steps: vec![Step::new("cargo", &["doc", "--no-deps", "--workspace"])],
         },
+        SegmentDefinition {
+            id: "clean-clone",
+            purpose: "a clean clone builds, tests, lints, and packages on its own",
+            tiers: &[Tier::Gate],
+            prerequisite: None,
+            steps: vec![Step::new("/bin/sh", &["-c", CLEAN_CLONE_CHECK])],
+        },
     ]
 }
+
+/// Builds, tests, lints, and packages the revision under test in a fresh
+/// clone from the remote.
+///
+/// The clone is the segment that proves independence. It carries only what
+/// the repository tracks, it sits in a temporary directory of its own, and
+/// nothing outside it is reachable from the commands that run there. A copy
+/// of the working tree would carry local files and would prove nothing.
+///
+/// A fresh clone holds no ignored file, so an empty ignored listing is the
+/// check that nothing local came along.
+const CLEAN_CLONE_CHECK: &str = concat!(
+    "dir=$(mktemp -d) || exit 1; ",
+    "trap 'rm -rf \"$dir\"' EXIT; ",
+    "url=$(git remote get-url origin) || exit 1; ",
+    "revision=$(git rev-parse HEAD) || exit 1; ",
+    "git clone --quiet \"$url\" \"$dir/clone\" || exit 1; ",
+    "git -C \"$dir/clone\" checkout --quiet \"$revision\" || ",
+    "{ echo 'the revision under test is not on the remote'; exit 1; }; ",
+    "if [ -n \"$(git -C \"$dir/clone\" status --porcelain --ignored)\" ]; then ",
+    "echo 'the clone carries files that the repository does not track'; exit 1; fi; ",
+    "cd \"$dir/clone\" || exit 1; ",
+    "cargo build || exit 1; ",
+    "cargo fmt --all --check || exit 1; ",
+    "cargo clippy --workspace --all-targets || exit 1; ",
+    "cargo test --workspace || exit 1; ",
+    "cargo package --package rp1db || exit 1"
+);
 
 /// Fails when a tracked manifest declares a path dependency that leaves the
 /// repository. A dependency outside the checkout cannot be resolved from a
@@ -899,7 +934,8 @@ mod tests {
                 "deps",
                 "package-contents",
                 "no-internal-references",
-                "docs"
+                "docs",
+                "clean-clone"
             ]
         );
     }
