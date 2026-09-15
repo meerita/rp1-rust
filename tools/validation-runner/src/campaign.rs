@@ -94,6 +94,7 @@ pub fn definition() -> Vec<SegmentDefinition> {
                 Step::new("cargo", &["build", "--workspace", "--all-targets"]),
                 Step::new("cargo", &["fmt", "--all", "--check"]),
                 Step::new("cargo", &["clippy", "--workspace", "--all-targets"]),
+                Step::new("/bin/sh", &["-c", LINT_ALLOWANCE_CHECK]),
             ],
         },
         SegmentDefinition {
@@ -189,6 +190,17 @@ const CLEAN_CLONE_CHECK: &str = concat!(
     "cargo clippy --workspace --all-targets || exit 1; ",
     "cargo test --workspace || exit 1; ",
     "cargo package --package rp1db || exit 1"
+);
+
+/// Fails when tracked Rust source carries a lint allowance.
+///
+/// The lint baseline is strict because the cost of a defect in a protocol
+/// client is high. An allowance weakens it silently, so the gate reports
+/// one rather than leaving it to be noticed in review.
+const LINT_ALLOWANCE_CHECK: &str = concat!(
+    "if git ls-files -z '*.rs' | xargs -0 grep -lnE '#!?\\[(allow|expect)\\('; then ",
+    "echo 'tracked source carries a lint allowance'; ",
+    "exit 1; fi"
 );
 
 /// Fails when a tracked manifest declares a path dependency that leaves the
