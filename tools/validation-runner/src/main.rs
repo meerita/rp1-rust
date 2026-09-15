@@ -24,7 +24,7 @@ use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 
-use campaign::{Campaign, SEGMENT_BUDGET, Tier};
+use campaign::{Campaign, SEGMENT_BUDGET, State, Tier, TreeState};
 use error::{Result, failed};
 use identity::EvidenceIdentity;
 use json::Object;
@@ -34,7 +34,7 @@ use time::Utc;
 
 const DEFAULT_TOPIC: &str = "repository";
 
-const USAGE: &str = "usage: validation-runner run --tier <dev|gate> [--topic <topic>]";
+const USAGE: &str = "usage: validation-runner run --tier <dev|gate> [--topic <topic>] [--resume]";
 
 fn main() -> ExitCode {
     match execute() {
@@ -49,6 +49,7 @@ fn main() -> ExitCode {
 struct Arguments {
     tier: Tier,
     topic: String,
+    resume: bool,
 }
 
 fn execute() -> Result<ExitCode> {
@@ -63,12 +64,13 @@ fn execute() -> Result<ExitCode> {
     let identity = EvidenceIdentity::resolve(&repository_root, &subject_revision, &definition)?;
 
     let now = Utc::now()?;
-    let record = RunRecord::create(
-        &repository_root.join(record::RECORDS_DIRECTORY),
-        arguments.tier.as_str(),
-        &now.date()?,
-        &arguments.topic,
-    )?;
+    let records_root = repository_root.join(record::RECORDS_DIRECTORY);
+    let (record, resuming) = select_record(&arguments, &records_root, &identity.digest(), now)?;
+
+    let tree_state = match repo::working_tree_changes(&repository_root)?.as_slice() {
+        [] => TreeState::Clean,
+        changes => TreeState::Modified(changes.to_vec()),
+    };
 
     let campaign = Campaign {
         tier: arguments.tier,
@@ -80,6 +82,8 @@ fn execute() -> Result<ExitCode> {
         working_dir: repository_root.clone(),
         environment: environment(&repository_root)?,
         created: now.timestamp()?,
+        resume: resuming,
+        tree_state,
     };
 
     let started = std::time::Instant::now();
@@ -88,16 +92,71 @@ fn execute() -> Result<ExitCode> {
 
     print_report(&campaign, &record, &report, elapsed, &repository_root);
 
-    Ok(if report.every_segment_passed() {
+    Ok(if closes(arguments.tier, &report) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     })
 }
 
+/// Reports whether the campaign satisfied what its tier asks of it.
+///
+/// A gate campaign closes only when it seals. A development campaign closes
+/// when every segment holds, because a working tree under change is the
+/// ordinary state during development.
+fn closes(tier: Tier, report: &campaign::Report) -> bool {
+    match tier {
+        Tier::Gate => report.state == State::Sealed,
+        Tier::Dev => report.every_segment_holds(),
+    }
+}
+
+/// Chooses the record this run writes into.
+///
+/// Resume continues the most recent record for the tier. A record that
+/// already holds results under another evidence identity is not continued,
+/// because a record that mixed two identities could not state which one it
+/// proves.
+fn select_record(
+    arguments: &Arguments,
+    records_root: &Path,
+    identity: &str,
+    now: Utc,
+) -> Result<(RunRecord, bool)> {
+    let create = || {
+        RunRecord::create(
+            records_root,
+            arguments.tier.as_str(),
+            &now.date()?,
+            &arguments.topic,
+        )
+    };
+
+    if !arguments.resume {
+        return Ok((create()?, false));
+    }
+
+    let Some(existing) = RunRecord::latest(records_root, arguments.tier.as_str())? else {
+        println!("No campaign to resume. Recording a new one.");
+        return Ok((create()?, false));
+    };
+
+    match existing.recorded_identity()? {
+        Some(recorded) if recorded != identity => {
+            println!(
+                "The most recent campaign holds results under another evidence identity. \
+                 Recording a new one."
+            );
+            Ok((create()?, false))
+        }
+        _ => Ok((existing, true)),
+    }
+}
+
 fn parse(arguments: Vec<String>) -> Result<Arguments> {
     let mut tier = None;
     let mut topic = DEFAULT_TOPIC.to_owned();
+    let mut resume = false;
     let mut rest = arguments.into_iter();
 
     match rest.next().as_deref() {
@@ -116,12 +175,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments> {
                 Some(value) => topic = value,
                 None => return failed(format!("`--topic` needs a value. {USAGE}")),
             },
-            "--resume" => {
-                return failed(
-                    "this runner cannot resume a campaign yet. \
-                     Run the campaign again to record a new one.",
-                );
-            }
+            "--resume" => resume = true,
             other => return failed(format!("`{other}` is not an option. {USAGE}")),
         }
     }
@@ -129,7 +183,11 @@ fn parse(arguments: Vec<String>) -> Result<Arguments> {
     let Some(tier) = tier else {
         return failed(format!("`--tier` is required. {USAGE}"));
     };
-    Ok(Arguments { tier, topic })
+    Ok(Arguments {
+        tier,
+        topic,
+        resume,
+    })
 }
 
 fn environment(repository_root: &Path) -> Result<Object> {
@@ -157,12 +215,12 @@ fn print_report(
     let passed = report
         .results
         .iter()
-        .filter(|result| result.status.is_pass())
+        .filter(|result| result.status.holds())
         .count();
     let blockers: Vec<String> = report
         .results
         .iter()
-        .filter(|result| !result.status.is_pass())
+        .filter(|result| !result.status.holds())
         .map(|result| format!("{} ({})", result.id, result.status.as_str()))
         .collect();
 
@@ -171,8 +229,9 @@ fn print_report(
     println!("Tier: {}", campaign.tier);
     println!("Revision: {}", campaign.subject_revision);
     println!(
-        "Segments: {passed}/{} valid, 0 reused",
-        report.results.len()
+        "Segments: {passed}/{} valid, {} reused",
+        report.results.len(),
+        report.reused()
     );
     println!("Duration: {:.1}s", elapsed.as_secs_f64());
     println!("Status: {}", report.state.as_str());
@@ -185,6 +244,10 @@ fn print_report(
         }
     );
     println!("Record: {}", display_record(record, repository_root));
+
+    for reason in &report.reasons {
+        println!("  does not seal: {reason}");
+    }
 
     for result in &report.results {
         if result.status == Status::Skipped
@@ -219,6 +282,7 @@ mod tests {
         let parsed: Arguments = parse(arguments(&["run", "--tier", "gate"]))?;
         assert_eq!(parsed.tier, Tier::Gate);
         assert_eq!(parsed.topic, "repository");
+        assert!(!parsed.resume);
         Ok(())
     }
 
@@ -233,7 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn refuses_resume_until_it_is_implemented() {
-        assert!(parse(arguments(&["run", "--tier", "gate", "--resume"])).is_err());
+    fn accepts_a_resume_request() -> Result<()> {
+        let parsed = parse(arguments(&["run", "--tier", "gate", "--resume"]))?;
+        assert!(parsed.resume);
+        Ok(())
     }
 }

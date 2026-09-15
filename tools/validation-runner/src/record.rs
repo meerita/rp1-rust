@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, failed};
-use crate::json::Object;
+use crate::json::{self, Object};
 
 /// The directory that holds run records. Git ignores it, and no build, test,
 /// or packaging operation reads from it.
@@ -47,6 +47,42 @@ impl RunRecord {
         Ok(Self { root, identifier })
     }
 
+    /// Opens an existing record directory.
+    pub fn open(root: PathBuf) -> Result<Self> {
+        let Some(identifier) = root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            return failed("a record directory must have a name");
+        };
+        if !root.is_dir() {
+            return failed(format!("`{identifier}` is not a record directory"));
+        }
+        Ok(Self { root, identifier })
+    }
+
+    /// Finds the most recent record for a tier.
+    pub fn latest(records_root: &Path, tier: &str) -> Result<Option<Self>> {
+        let tier_root = records_root.join(tier);
+        if !tier_root.is_dir() {
+            return Ok(None);
+        }
+
+        let mut names: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&tier_root)? {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        names.sort();
+
+        match names.into_iter().next_back() {
+            Some(name) => Ok(Some(Self::open(tier_root.join(name))?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn identifier(&self) -> &str {
         &self.identifier
     }
@@ -77,24 +113,53 @@ impl RunRecord {
         Ok(())
     }
 
-    /// Counts the attempts a segment already has in this record.
-    pub fn attempts_for(&self, segment: &str) -> Result<u32> {
+    /// Reads every journal entry in the order it was recorded.
+    pub fn entries(&self) -> Result<Vec<JournalEntry>> {
         let path = self.root.join(JOURNAL_FILE);
         if !path.exists() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
-        let marker = format!("\"segment\":\"{segment}\"");
         let journal = fs::read_to_string(path)?;
-        let attempts = journal
-            .lines()
-            .filter(|line| line.contains(&marker))
+        let mut entries = Vec::new();
+        for line in journal.lines().filter(|line| !line.trim().is_empty()) {
+            entries.push(JournalEntry::parse(line)?);
+        }
+        Ok(entries)
+    }
+
+    /// Counts the attempts a segment already has in this record.
+    pub fn attempts_for(&self, segment: &str) -> Result<u32> {
+        let attempts = self
+            .entries()?
+            .iter()
+            .filter(|entry| entry.segment == segment)
             .count();
 
         u32::try_from(attempts).map_or_else(
             |_| failed("this record holds more attempts than it can count"),
             Ok,
         )
+    }
+
+    /// Reads the most recent attempt recorded for a segment.
+    pub fn last_entry_for(&self, segment: &str) -> Result<Option<JournalEntry>> {
+        Ok(self
+            .entries()?
+            .into_iter()
+            .rfind(|entry| entry.segment == segment))
+    }
+
+    /// Reads the evidence identity this record already holds results under.
+    ///
+    /// A record with no entries holds no identity yet, so any campaign may
+    /// continue into it.
+    pub fn recorded_identity(&self) -> Result<Option<String>> {
+        Ok(self
+            .entries()?
+            .into_iter()
+            .next_back()
+            .map(|entry| entry.evidence_identity))
     }
 
     /// The file that holds the raw output of one attempt.
@@ -124,6 +189,45 @@ impl RunRecord {
     #[cfg(test)]
     pub fn journal_path(&self) -> PathBuf {
         self.root.join(JOURNAL_FILE)
+    }
+}
+
+/// One recorded attempt, read back from the journal.
+#[derive(Clone, Debug)]
+pub struct JournalEntry {
+    pub segment: String,
+    pub attempt: u32,
+    pub status: String,
+    pub evidence_identity: String,
+    pub evidence: String,
+}
+
+impl JournalEntry {
+    fn parse(line: &str) -> Result<Self> {
+        let fields = json::parse_flat_object(line)?;
+        let Some(segment) = json::string_field(&fields, "segment") else {
+            return failed("a journal entry must name its segment");
+        };
+        let Some(status) = json::string_field(&fields, "status") else {
+            return failed("a journal entry must state its status");
+        };
+        let Some(identity) = json::string_field(&fields, "evidence_identity") else {
+            return failed("a journal entry must state the identity it holds under");
+        };
+        let attempt = json::number_field(&fields, "attempt").unwrap_or(0);
+        let Ok(attempt) = u32::try_from(attempt) else {
+            return failed("a journal entry states an attempt number it cannot hold");
+        };
+
+        Ok(Self {
+            segment: segment.to_owned(),
+            attempt,
+            status: status.to_owned(),
+            evidence_identity: identity.to_owned(),
+            evidence: json::string_field(&fields, "evidence")
+                .unwrap_or_default()
+                .to_owned(),
+        })
     }
 }
 
@@ -163,9 +267,13 @@ mod tests {
     use crate::json::Object;
     use crate::testing::TempDir;
 
-    fn entry(segment: &str) -> Object {
+    fn entry(segment: &str, attempt: u32) -> Object {
         let mut object = Object::new();
         object.string("segment", segment);
+        object.number("attempt", u64::from(attempt));
+        object.string("status", "pass");
+        object.string("evidence_identity", "identity");
+        object.string("evidence", "segments/evidence.txt");
         object
     }
 
@@ -186,16 +294,29 @@ mod tests {
         let temp = TempDir::new("record-journal")?;
         let record = RunRecord::create(temp.path(), "dev", "2026-09-15", "repository")?;
 
-        record.append_journal(&entry("unit-tests"))?;
-        record.append_journal(&entry("msrv"))?;
-        record.append_journal(&entry("unit-tests"))?;
+        record.append_journal(&entry("unit-tests", 1))?;
+        record.append_journal(&entry("msrv", 1))?;
+        record.append_journal(&entry("unit-tests", 2))?;
 
         let journal = std::fs::read_to_string(record.journal_path())?;
-        let lines: Vec<&str> = journal.lines().collect();
 
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines.first(), Some(&"{\"segment\":\"unit-tests\"}"));
-        assert_eq!(lines.get(1), Some(&"{\"segment\":\"msrv\"}"));
+        assert_eq!(journal.lines().count(), 3);
+        let entries = record.entries()?;
+        assert_eq!(
+            entries.first().map(|entry| entry.segment.as_str()),
+            Some("unit-tests")
+        );
+        assert_eq!(
+            entries.get(1).map(|entry| entry.segment.as_str()),
+            Some("msrv")
+        );
+        assert_eq!(
+            record
+                .last_entry_for("unit-tests")?
+                .map(|entry| entry.attempt),
+            Some(2)
+        );
+        assert_eq!(record.recorded_identity()?.as_deref(), Some("identity"));
         assert_eq!(record.attempts_for("unit-tests")?, 2);
         assert_eq!(record.attempts_for("msrv")?, 1);
         assert_eq!(record.attempts_for("deps")?, 0);

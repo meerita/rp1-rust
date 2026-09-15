@@ -23,6 +23,7 @@ pub enum Status {
     Fail,
     Timeout,
     Skipped,
+    Cached,
 }
 
 impl Status {
@@ -32,12 +33,32 @@ impl Status {
             Self::Fail => "fail",
             Self::Timeout => "timeout",
             Self::Skipped => "skipped",
+            Self::Cached => "cached",
         }
     }
 
-    /// Reports whether the status counts as evidence that the segment holds.
-    pub const fn is_pass(self) -> bool {
-        matches!(self, Self::Pass)
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pass" => Some(Self::Pass),
+            "fail" => Some(Self::Fail),
+            "timeout" => Some(Self::Timeout),
+            "skipped" => Some(Self::Skipped),
+            "cached" => Some(Self::Cached),
+            _ => None,
+        }
+    }
+
+    /// Reports whether the status is evidence that the segment holds.
+    ///
+    /// A reused result counts. A skipped segment does not, because nothing
+    /// ran and nothing was proven.
+    pub const fn holds(self) -> bool {
+        matches!(self, Self::Pass | Self::Cached)
+    }
+
+    /// Reports whether this attempt executed rather than reused evidence.
+    pub const fn executed(self) -> bool {
+        !matches!(self, Self::Cached)
     }
 }
 
