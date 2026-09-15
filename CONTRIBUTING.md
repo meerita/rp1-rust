@@ -101,8 +101,10 @@ A commit message states what changed, why it changed, the contract it
 preserves, and the validation that ran with its exact commands and
 results. It stands on its own for a reader who has only the repository.
 
-Do not add AI, agent, or tool attribution to a commit, a pull request, or
-a comment.
+Do not credit an AI model, an agent, or an AI process for the work, in a
+commit, a pull request, or a comment. This covers the subject, the body,
+every trailer, and every co-author line. Naming a tool is not
+attribution: the message above already states the commands that ran.
 
 ## Pull requests
 
