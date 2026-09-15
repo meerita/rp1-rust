@@ -8,7 +8,7 @@ RUNNER_MANIFEST := tools/validation-runner/Cargo.toml
 RUNNER := $(CARGO) run --quiet --package validation-runner --
 
 .DEFAULT_GOAL := help
-.PHONY: help build smoke test gate gate-resume fuzz bench conformance
+.PHONY: help build smoke test gate gate-resume deps fuzz bench conformance
 
 # Fail with the install command when a required host tool is absent.
 define require_command
@@ -36,6 +36,7 @@ help:
 	@echo "  make test          development validation campaign, recorded"
 	@echo "  make gate          complete gate campaign, recorded and sealed"
 	@echo "  make gate-resume   resume the current gate campaign"
+	@echo "  make deps          audit the dependency graph"
 	@echo "  make fuzz          one bounded fuzz segment"
 	@echo "  make bench         benchmark campaign"
 	@echo "  make conformance   RP-1 conformance campaign"
@@ -67,6 +68,10 @@ gate-resume:
 	$(call require_command,cargo,https://rustup.rs)
 	$(require_runner)
 	$(RUNNER) run --tier gate --resume
+
+deps:
+	$(call require_command,cargo-deny,cargo install cargo-deny)
+	$(CARGO) deny check
 
 fuzz:
 	@echo "error: this repository has no fuzz campaign yet." >&2

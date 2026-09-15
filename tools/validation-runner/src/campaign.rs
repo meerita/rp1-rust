@@ -116,8 +116,31 @@ pub fn definition() -> Vec<SegmentDefinition> {
                 &["+1.85.0", "check", "--package", "rp1db"],
             )],
         },
+        SegmentDefinition {
+            id: "deps",
+            purpose: "the dependency graph satisfies the committed supply-chain policy",
+            tiers: &[Tier::Dev, Tier::Gate],
+            prerequisite: Some(Prerequisite {
+                probe: Step::new("cargo", &["deny", "--version"]),
+                remedy: "install it with `cargo install cargo-deny`".to_owned(),
+            }),
+            steps: vec![
+                Step::new("cargo", &["deny", "check"]),
+                Step::new("/bin/sh", &["-c", LOCAL_PATH_CHECK]),
+            ],
+        },
     ]
 }
+
+/// Fails when a tracked manifest declares a path dependency that leaves the
+/// repository. A dependency outside the checkout cannot be resolved from a
+/// clean clone, and it is the shape a private dependency would take.
+const LOCAL_PATH_CHECK: &str = concat!(
+    "if git ls-files -z '*Cargo.toml' | xargs -0 grep -lE ",
+    "'path[[:space:]]*=[[:space:]]*\"[^\"]*[.][.]'; then ",
+    "echo 'a manifest declares a path dependency that leaves the repository'; ",
+    "exit 1; fi"
+);
 
 /// The segments a tier requires, in execution order.
 pub fn required(tier: Tier) -> Vec<SegmentDefinition> {
@@ -790,7 +813,44 @@ mod tests {
             .map(SegmentDefinition::id)
             .collect();
 
-        assert_eq!(dev, vec!["build-and-lint", "unit-tests", "msrv"]);
+        assert_eq!(dev, vec!["build-and-lint", "unit-tests", "msrv", "deps"]);
+
+        let gate: Vec<&str> = required(Tier::Gate)
+            .iter()
+            .map(SegmentDefinition::id)
+            .collect();
+
+        assert_eq!(gate, vec!["build-and-lint", "unit-tests", "msrv", "deps"]);
+    }
+
+    #[test]
+    fn the_local_path_check_rejects_a_manifest_that_leaves_the_repository() -> Result<()> {
+        let temp = TempDir::new("local-paths")?;
+        let root = temp.path();
+
+        let _ = crate::process::capture("git", &["init", "--quiet"], root)?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[dependencies]\nprivate = { path = \"../../private/crate\" }\n",
+        )?;
+        let _ = crate::process::capture("git", &["add", "."], root)?;
+
+        let record = RunRecord::create(root, "gate", "2026-09-15", "repository")?;
+        let report = campaign(
+            root,
+            vec![segment(
+                "local-paths",
+                vec![Step::new("/bin/sh", &["-c", super::LOCAL_PATH_CHECK])],
+            )],
+        )
+        .execute(&record, &clock())?;
+
+        assert_eq!(
+            report.results.first().map(|result| result.status),
+            Some(Status::Fail),
+            "a path dependency outside the repository stops the audit"
+        );
+        Ok(())
     }
 
     #[test]
