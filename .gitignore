@@ -25,6 +25,7 @@ lcov.info
 # Fuzzing
 fuzz/artifacts/
 fuzz/target/
+fuzz/corpus/
 
 # Environment
 .env

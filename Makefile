@@ -74,10 +74,9 @@ deps:
 	$(CARGO) deny check
 
 fuzz:
-	@echo "error: this repository has no fuzz campaign yet." >&2
-	@echo "the fuzz targets arrive with the wire codec, which parses" >&2
-	@echo "peer-controlled bytes and is the first thing worth fuzzing." >&2
-	@exit 1
+	$(call require_command,cargo-fuzz,cargo install cargo-fuzz)
+	$(call require_command,cargo,https://rustup.rs)
+	$(CARGO) +nightly fuzz run frame_decode -- -runs=20000 -max_total_time=60
 
 bench:
 	@echo "error: this repository has no benchmark campaign yet." >&2
