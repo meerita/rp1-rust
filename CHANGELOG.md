@@ -41,5 +41,5 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Property, malformed-input, and bounded fuzz coverage for the decoder.
 - `make fuzz` runs the frame decoder fuzz target.
 
-The crate exposes only the low-level `protocol` module. It has no client
-API.
+The crate exposes a low-level `protocol` module and a `Connection` surface
+that completes the negotiation handshake. It exposes no command surface.

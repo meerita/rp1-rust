@@ -1868,4 +1868,49 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn handshake_request_encode_derives_the_capability_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let entries = vec![
+            CapabilityEntry::new(1, &[0xaa]),
+            CapabilityEntry::new(4, &[]),
+        ];
+        let request = HandshakeRequest::new(0, 0, 65_536, CapabilityEntries::new(entries));
+        let payload = request.encode();
+        assert_eq!(payload.get(8..10), Some(&[2u8, 0][..]), "capability count");
+        let decoded = HandshakeRequest::decode(&payload)
+            .map_err(|failure| format!("request decode failed: {}", failure.class().name()))?;
+        assert_eq!(decoded.capability_count(), 2);
+        assert_eq!(decoded.capability_entries().count(), 2);
+        assert_eq!(
+            decoded
+                .capability_entries()
+                .entries()
+                .first()
+                .map(|entry| entry.identifier()),
+            Some(1)
+        );
+        assert_eq!(decoded.encode(), payload, "re-encode is stable");
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_response_encode_derives_the_accepted_capability_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = from_hex("0000000001000010010001000000");
+        let offer = HandshakeOffer {
+            minimum_protocol_version: 0,
+            maximum_protocol_version: 0,
+            capability_ids: &[1],
+        };
+        let response = HandshakeResponse::decode(&payload, &offer)
+            .map_err(|failure| format!("response decode failed: {}", failure.class().name()))?;
+        assert_eq!(response.accepted_capability_count(), 1);
+        assert_eq!(response.negotiated_protocol_version(), 0);
+        assert_eq!(response.negotiated_maximum_frame_size(), 65_536);
+        assert_eq!(response.negotiated_maximum_metadata_size(), 4_096);
+        assert_eq!(response.encode(), payload, "re-encode is stable");
+        Ok(())
+    }
 }
