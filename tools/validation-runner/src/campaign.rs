@@ -84,6 +84,13 @@ impl SegmentDefinition {
 
 /// Every segment this runner knows how to execute.
 pub fn definition() -> Vec<SegmentDefinition> {
+    let mut segments = core_segments();
+    segments.extend(evidence_segments());
+    segments
+}
+
+/// The segments that compile, test, and audit the workspace and the codec.
+fn core_segments() -> Vec<SegmentDefinition> {
     vec![
         SegmentDefinition {
             id: "build-and-lint",
@@ -140,6 +147,12 @@ pub fn definition() -> Vec<SegmentDefinition> {
                 Step::new("/bin/sh", &["-c", LOCAL_PATH_CHECK]),
             ],
         },
+    ]
+}
+
+/// The segments that check evidence, documentation, fuzzing, and independence.
+fn evidence_segments() -> Vec<SegmentDefinition> {
+    vec![
         SegmentDefinition {
             id: "package-contents",
             purpose: "the published package carries the intended files and nothing else",
@@ -163,6 +176,27 @@ pub fn definition() -> Vec<SegmentDefinition> {
             tiers: &[Tier::Dev, Tier::Gate],
             prerequisite: None,
             steps: vec![Step::new("cargo", &["doc", "--no-deps", "--workspace"])],
+        },
+        SegmentDefinition {
+            id: "fuzz-frame-decoder",
+            purpose: "the frame decoder survives a bounded fuzzing run",
+            tiers: &[Tier::Dev, Tier::Gate],
+            prerequisite: Some(Prerequisite {
+                probe: Step::new("cargo", &["fuzz", "--version"]),
+                remedy: "install it with `cargo install cargo-fuzz`".to_owned(),
+            }),
+            steps: vec![Step::new(
+                "cargo",
+                &[
+                    "+nightly",
+                    "fuzz",
+                    "run",
+                    "frame_decode",
+                    "--",
+                    "-runs=10000",
+                    "-max_total_time=45",
+                ],
+            )],
         },
         SegmentDefinition {
             id: "clean-clone",
@@ -942,7 +976,8 @@ mod tests {
                 "msrv",
                 "deps",
                 "no-internal-references",
-                "docs"
+                "docs",
+                "fuzz-frame-decoder"
             ]
         );
 
@@ -962,6 +997,7 @@ mod tests {
                 "package-contents",
                 "no-internal-references",
                 "docs",
+                "fuzz-frame-decoder",
                 "clean-clone"
             ]
         );
