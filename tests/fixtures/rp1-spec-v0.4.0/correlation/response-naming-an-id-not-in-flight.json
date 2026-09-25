@@ -1,0 +1,20 @@
+{
+  "id": "correlation/response-naming-an-id-not-in-flight",
+  "revision": "v0.4.0",
+  "protocol_version": 0,
+  "clause": "A request id not in flight",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000000000000000000000300000000000000",
+    "role": "client",
+    "in_flight": [
+      "1"
+    ]
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

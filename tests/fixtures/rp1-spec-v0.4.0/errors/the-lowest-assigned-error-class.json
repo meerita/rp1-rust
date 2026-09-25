@@ -1,0 +1,39 @@
+{
+  "id": "errors/the-lowest-assigned-error-class",
+  "revision": "v0.4.0",
+  "protocol_version": 0,
+  "clause": "Malformed request",
+  "direction": "both",
+  "provenance": "derived-from-specification",
+  "input": {
+    "fields": {
+      "version": 0,
+      "kind": 3,
+      "flags": 0,
+      "code": 1,
+      "request_id": "0",
+      "metadata": [],
+      "detail_length": 0,
+      "detail_bytes": "",
+      "text": ""
+    },
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 3,
+      "flags": 0,
+      "code": 1,
+      "metadata_length": 0,
+      "payload_length": 2,
+      "request_id": "0",
+      "detail_length": 0,
+      "detail_bytes": "",
+      "text": ""
+    },
+    "bytes": "00030000010000000200000000000000000000000000",
+    "bytes_consumed": 22
+  }
+}

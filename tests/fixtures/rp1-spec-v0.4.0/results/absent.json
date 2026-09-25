@@ -1,0 +1,25 @@
+{
+  "id": "results/absent",
+  "revision": "v0.4.0",
+  "protocol_version": 0,
+  "clause": "Absent",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000001000000000000000100000000000000",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 2,
+      "flags": 0,
+      "code": 1,
+      "metadata_length": 0,
+      "payload_length": 0,
+      "request_id": "1"
+    },
+    "bytes_consumed": 20
+  }
+}

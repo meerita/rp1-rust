@@ -5,7 +5,7 @@
 //! implements.
 //!
 //! This crate is in early development. It exposes a low-level protocol
-//! module that implements the `rp1-spec` `v0.2.0` framing and codec
-//! contract. It still has no client API and no transport.
+//! module that implements the `rp1-spec` `v0.4.0` framing, codec, handshake,
+//! and negotiation contract. It still has no client API and no transport.
 
 pub mod protocol;

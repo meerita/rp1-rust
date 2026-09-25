@@ -29,6 +29,19 @@ fn header(
     out
 }
 
+/// Decodes under the negotiated state and the pre-negotiation bounds.
+fn decode_at<'a>(bytes: &'a [u8], role: Role, in_flight: &[u64]) -> Step<'a> {
+    protocol::decode(
+        bytes,
+        protocol::Admission {
+            role,
+            state: protocol::ConnectionState::Negotiated,
+            limits: protocol::Limits::PRE_NEGOTIATION,
+            in_flight,
+        },
+    )
+}
+
 /// Asserts a decode produced the exact class and scope.
 fn expect_failure(
     bytes: &[u8],
@@ -37,7 +50,7 @@ fn expect_failure(
     class: ErrorClass,
     scope: FailureScope,
 ) -> Result<(), Box<dyn Error>> {
-    match protocol::decode(bytes, role, in_flight) {
+    match decode_at(bytes, role, in_flight) {
         Step::Failure { failure, .. } => {
             assert_eq!(failure.class(), class, "class");
             assert_eq!(failure.scope(), scope, "scope");
@@ -59,7 +72,7 @@ fn every_truncation_reports_the_bytes_it_requires() -> Result<(), Box<dyn Error>
     let bytes = protocol::encode(&outgoing)?;
     for end in 0..bytes.len() {
         let prefix = bytes.get(..end).ok_or("prefix out of range")?;
-        match protocol::decode(prefix, Role::Client, &[1]) {
+        match decode_at(prefix, Role::Client, &[1]) {
             Step::Need(required) => assert!(required > end, "required {required} not above {end}"),
             other => {
                 return Err(format!("prefix of {end} bytes was not incomplete: {other:?}").into());

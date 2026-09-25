@@ -1,0 +1,18 @@
+{
+  "id": "correlation/second-terminal-frame-for-a-retired-id",
+  "revision": "v0.4.0",
+  "protocol_version": 0,
+  "clause": "A request id not in flight",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000000000000000000000500000000000000",
+    "role": "client",
+    "in_flight": []
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

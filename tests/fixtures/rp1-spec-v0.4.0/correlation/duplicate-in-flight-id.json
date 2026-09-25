@@ -1,0 +1,20 @@
+{
+  "id": "correlation/duplicate-in-flight-id",
+  "revision": "v0.4.0",
+  "protocol_version": 0,
+  "clause": "A request id already in flight",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0001000000000000000000000200000000000000",
+    "role": "server",
+    "in_flight": [
+      "2"
+    ]
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

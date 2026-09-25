@@ -1,24 +1,90 @@
 //! Low-level RP-1 protocol wire types and codec.
 //!
-//! This module owns the `rp1-spec` `v0.2.0` framing and codec contract: the
-//! validated header and metadata types, the failure classification, the
-//! incremental decoder, and the encoder.
+//! This module owns the `rp1-spec` `v0.4.0` framing and codec contract: the
+//! validated header and metadata types, the handshake payload types, the
+//! failure classification, the incremental decoder, and the encoder.
 //!
-//! It does not own transport, connection state, request state, or any client
+//! It does not own transport, connection policy, request state, or any client
 //! API. `decode` and `encode` are pure functions over byte slices and
 //! validated values.
 
 /// The public specification revision this module implements.
-pub const SPEC_REVISION: &str = "v0.2.0";
+pub const SPEC_REVISION: &str = "v0.4.0";
 
 /// The fixed length of the frame header in bytes.
 pub const HEADER_LENGTH: usize = 20;
 
-/// The maximum total length of a frame in bytes.
+/// The maximum total length of a frame in bytes before negotiation.
 pub const MAX_FRAME_SIZE: u64 = 65_536;
 
-/// The maximum length of the metadata region in bytes.
+/// The maximum length of the metadata region in bytes before negotiation.
 pub const MAX_METADATA_SIZE: u16 = 4_096;
+
+/// The opcode protocol version 0 assigns to the handshake.
+pub const HANDSHAKE_OPCODE: u16 = 0x0001;
+
+/// The lowest value a responder may state as the negotiated maximum frame
+/// size.
+pub const MINIMUM_NEGOTIATED_FRAME_SIZE: u64 = 65_536;
+
+/// The lowest value a responder may state as the negotiated maximum metadata
+/// size.
+pub const MINIMUM_NEGOTIATED_METADATA_SIZE: u16 = 4_096;
+
+/// The highest value the one-byte header `version` field can carry.
+const HIGHEST_HEADER_VERSION: u16 = 255;
+
+/// The state a connection occupies when it reads a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// The transport is connected and the handshake is not complete.
+    PreNegotiation,
+    /// The handshake response has been read.
+    Negotiated,
+    /// The transport closed or the connection became unusable.
+    Terminal,
+}
+
+/// The size bounds in force when a receiver reads a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The maximum total length of a frame in bytes.
+    pub frame_size: u64,
+    /// The maximum length of the metadata region in bytes.
+    pub metadata_size: u16,
+}
+
+impl Limits {
+    /// The constants in force before the handshake completes.
+    pub const PRE_NEGOTIATION: Self = Self {
+        frame_size: MAX_FRAME_SIZE,
+        metadata_size: MAX_METADATA_SIZE,
+    };
+}
+
+/// The connection context a receiver decodes a frame under.
+#[derive(Debug, Clone, Copy)]
+pub struct Admission<'a> {
+    /// The peer that is decoding.
+    pub role: Role,
+    /// The connection state the receiver occupies.
+    pub state: ConnectionState,
+    /// The size bounds in force.
+    pub limits: Limits,
+    /// The request ids in flight at the receiver.
+    pub in_flight: &'a [u64],
+}
+
+impl Default for Admission<'_> {
+    fn default() -> Self {
+        Self {
+            role: Role::Server,
+            state: ConnectionState::Negotiated,
+            limits: Limits::PRE_NEGOTIATION,
+            in_flight: &[],
+        }
+    }
+}
 
 /// The peer that is decoding a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +500,366 @@ impl<'a> MetadataRegion<'a> {
     }
 }
 
+/// One entry of a handshake capability region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityEntry<'a> {
+    identifier: u16,
+    value: &'a [u8],
+}
+
+impl<'a> CapabilityEntry<'a> {
+    /// Builds an entry from its identifier and opaque value bytes.
+    #[must_use]
+    pub const fn new(identifier: u16, value: &'a [u8]) -> Self {
+        Self { identifier, value }
+    }
+
+    /// Returns the entry identifier.
+    #[must_use]
+    pub const fn identifier(self) -> u16 {
+        self.identifier
+    }
+
+    /// Returns the opaque value bytes.
+    #[must_use]
+    pub const fn value(self) -> &'a [u8] {
+        self.value
+    }
+}
+
+/// A validated region of handshake capability entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityEntries<'a> {
+    entries: Vec<CapabilityEntry<'a>>,
+}
+
+impl<'a> CapabilityEntries<'a> {
+    /// Builds a region from entries in wire order.
+    #[must_use]
+    pub const fn new(entries: Vec<CapabilityEntry<'a>>) -> Self {
+        Self { entries }
+    }
+
+    /// Returns the entries in wire order.
+    #[must_use]
+    pub fn entries(&self) -> &[CapabilityEntry<'a>] {
+        &self.entries
+    }
+
+    /// Returns the number of entries.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Parses a region whose entries must fill it exactly.
+    fn parse(region: &'a [u8]) -> Option<Self> {
+        let mut entries = Vec::new();
+        let mut rest = region;
+        while !rest.is_empty() {
+            let identifier = read_u16_le(rest, 0)?;
+            let value_length = read_u16_le(rest, 2)?;
+            let entry_length = 4usize.checked_add(usize::from(value_length))?;
+            if entry_length > rest.len() {
+                return None;
+            }
+            let value = rest.get(4..entry_length)?;
+            entries.push(CapabilityEntry::new(identifier, value));
+            rest = rest.get(entry_length..)?;
+        }
+        Some(Self { entries })
+    }
+
+    /// Checks that the identifiers strictly ascend.
+    fn check_ascending(&self) -> Result<(), Failure> {
+        let mut previous: Option<u16> = None;
+        for entry in &self.entries {
+            if let Some(previous_identifier) = previous {
+                if entry.identifier <= previous_identifier {
+                    return Err(Failure::malformed_request());
+                }
+            }
+            previous = Some(entry.identifier);
+        }
+        Ok(())
+    }
+}
+
+/// The versions and capabilities an offerer proposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandshakeOffer<'a> {
+    /// The lowest protocol version the offerer accepts.
+    pub minimum_protocol_version: u16,
+    /// The highest protocol version the offerer accepts.
+    pub maximum_protocol_version: u16,
+    /// The capability identifiers the offerer offered.
+    pub capability_ids: &'a [u16],
+}
+
+impl HandshakeOffer<'_> {
+    /// Returns whether `version` lies inside the offered range.
+    #[must_use]
+    pub const fn contains_version(&self, version: u16) -> bool {
+        version >= self.minimum_protocol_version && version <= self.maximum_protocol_version
+    }
+
+    /// Returns whether the offerer offered `identifier`.
+    #[must_use]
+    pub fn offers_capability(&self, identifier: u16) -> bool {
+        self.capability_ids.contains(&identifier)
+    }
+}
+
+/// The validated handshake request payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandshakeRequest<'a> {
+    client_maximum_protocol_version: u16,
+    client_minimum_protocol_version: u16,
+    client_desired_maximum_frame_size: u32,
+    capability_count: u16,
+    capability_entries: CapabilityEntries<'a>,
+}
+
+impl<'a> HandshakeRequest<'a> {
+    /// The fixed length of the request head in bytes.
+    pub const HEAD_LENGTH: usize = 10;
+
+    /// Decodes and validates a handshake request payload as untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a connection-fatal malformed request failure when the payload
+    /// is shorter than its head, its version range maximum is below its
+    /// minimum, its entries do not fill the payload exactly, its entries are
+    /// not strictly ascending, or its declared count disagrees with the
+    /// entries.
+    pub fn decode(payload: &'a [u8]) -> Result<Self, Failure> {
+        if payload.len() < Self::HEAD_LENGTH {
+            return Err(Failure::malformed_request());
+        }
+        let client_maximum_protocol_version =
+            read_u16_le(payload, 0).ok_or_else(Failure::malformed_request)?;
+        let client_minimum_protocol_version =
+            read_u16_le(payload, 2).ok_or_else(Failure::malformed_request)?;
+        let client_desired_maximum_frame_size =
+            read_u32_le(payload, 4).ok_or_else(Failure::malformed_request)?;
+        let capability_count = read_u16_le(payload, 8).ok_or_else(Failure::malformed_request)?;
+        if client_maximum_protocol_version < client_minimum_protocol_version {
+            return Err(Failure::malformed_request());
+        }
+        let tail = payload
+            .get(Self::HEAD_LENGTH..)
+            .ok_or_else(Failure::malformed_request)?;
+        let capability_entries =
+            CapabilityEntries::parse(tail).ok_or_else(Failure::malformed_request)?;
+        capability_entries.check_ascending()?;
+        if usize::from(capability_count) != capability_entries.count() {
+            return Err(Failure::malformed_request());
+        }
+        Ok(Self {
+            client_maximum_protocol_version,
+            client_minimum_protocol_version,
+            client_desired_maximum_frame_size,
+            capability_count,
+            capability_entries,
+        })
+    }
+
+    /// Encodes the request, deriving the capability count from the entries.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.client_maximum_protocol_version.to_le_bytes());
+        out.extend_from_slice(&self.client_minimum_protocol_version.to_le_bytes());
+        out.extend_from_slice(&self.client_desired_maximum_frame_size.to_le_bytes());
+        let count = u16::try_from(self.capability_entries.count()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for entry in self.capability_entries.entries() {
+            out.extend_from_slice(&entry.identifier().to_le_bytes());
+            let value_length = u16::try_from(entry.value().len()).unwrap_or(u16::MAX);
+            out.extend_from_slice(&value_length.to_le_bytes());
+            out.extend_from_slice(entry.value());
+        }
+        out
+    }
+
+    /// Returns the highest proposed version, which is also the version the
+    /// offerer accepts as an upper bound.
+    #[must_use]
+    pub const fn client_maximum_protocol_version(&self) -> u16 {
+        self.client_maximum_protocol_version
+    }
+
+    /// Returns the lowest proposed version.
+    #[must_use]
+    pub const fn client_minimum_protocol_version(&self) -> u16 {
+        self.client_minimum_protocol_version
+    }
+
+    /// Returns the desired maximum frame size.
+    #[must_use]
+    pub const fn client_desired_maximum_frame_size(&self) -> u32 {
+        self.client_desired_maximum_frame_size
+    }
+
+    /// Returns the declared capability count.
+    #[must_use]
+    pub const fn capability_count(&self) -> u16 {
+        self.capability_count
+    }
+
+    /// Returns the capability entries.
+    #[must_use]
+    pub const fn capability_entries(&self) -> &CapabilityEntries<'a> {
+        &self.capability_entries
+    }
+
+    /// Returns the highest version this request names that `supported` also
+    /// supports, or `None` when the two sets do not intersect.
+    #[must_use]
+    pub fn highest_mutual_version(&self, supported: &[u16]) -> Option<u16> {
+        supported
+            .iter()
+            .copied()
+            .filter(|version| {
+                *version >= self.client_minimum_protocol_version
+                    && *version <= self.client_maximum_protocol_version
+            })
+            .max()
+    }
+}
+
+/// The validated handshake response payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandshakeResponse<'a> {
+    negotiated_protocol_version: u16,
+    negotiated_maximum_frame_size: u32,
+    negotiated_maximum_metadata_size: u16,
+    accepted_capability_count: u16,
+    accepted_capability_entries: CapabilityEntries<'a>,
+}
+
+impl<'a> HandshakeResponse<'a> {
+    /// The fixed length of the response head in bytes.
+    pub const HEAD_LENGTH: usize = 10;
+
+    /// Decodes and validates a handshake response payload against the offer
+    /// it answers, as untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a connection-fatal malformed request failure when the payload
+    /// is shorter than its head, its entries do not fill the payload exactly,
+    /// its entries are not strictly ascending, its declared count disagrees
+    /// with the entries, the negotiated version lies outside the offered
+    /// range or above the header width, or a negotiated bound lies below its
+    /// floor. Returns a connection-fatal protocol violation when an accepted
+    /// entry names a capability the offer did not offer.
+    pub fn decode(payload: &'a [u8], offer: &HandshakeOffer<'_>) -> Result<Self, Failure> {
+        if payload.len() < Self::HEAD_LENGTH {
+            return Err(Failure::malformed_request());
+        }
+        let negotiated_protocol_version =
+            read_u16_le(payload, 0).ok_or_else(Failure::malformed_request)?;
+        let negotiated_maximum_frame_size =
+            read_u32_le(payload, 2).ok_or_else(Failure::malformed_request)?;
+        let negotiated_maximum_metadata_size =
+            read_u16_le(payload, 6).ok_or_else(Failure::malformed_request)?;
+        let accepted_capability_count =
+            read_u16_le(payload, 8).ok_or_else(Failure::malformed_request)?;
+        let tail = payload
+            .get(Self::HEAD_LENGTH..)
+            .ok_or_else(Failure::malformed_request)?;
+        let accepted_capability_entries =
+            CapabilityEntries::parse(tail).ok_or_else(Failure::malformed_request)?;
+        accepted_capability_entries.check_ascending()?;
+        if usize::from(accepted_capability_count) != accepted_capability_entries.count() {
+            return Err(Failure::malformed_request());
+        }
+        if negotiated_protocol_version > HIGHEST_HEADER_VERSION {
+            return Err(Failure::malformed_request());
+        }
+        if !offer.contains_version(negotiated_protocol_version) {
+            return Err(Failure::malformed_request());
+        }
+        if u64::from(negotiated_maximum_frame_size) < MINIMUM_NEGOTIATED_FRAME_SIZE {
+            return Err(Failure::malformed_request());
+        }
+        if negotiated_maximum_metadata_size < MINIMUM_NEGOTIATED_METADATA_SIZE {
+            return Err(Failure::malformed_request());
+        }
+        for entry in accepted_capability_entries.entries() {
+            if !offer.offers_capability(entry.identifier()) {
+                return Err(Failure::protocol_violation());
+            }
+        }
+        Ok(Self {
+            negotiated_protocol_version,
+            negotiated_maximum_frame_size,
+            negotiated_maximum_metadata_size,
+            accepted_capability_count,
+            accepted_capability_entries,
+        })
+    }
+
+    /// Encodes the response, deriving the accepted count from the entries.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.negotiated_protocol_version.to_le_bytes());
+        out.extend_from_slice(&self.negotiated_maximum_frame_size.to_le_bytes());
+        out.extend_from_slice(&self.negotiated_maximum_metadata_size.to_le_bytes());
+        let count = u16::try_from(self.accepted_capability_entries.count()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for entry in self.accepted_capability_entries.entries() {
+            out.extend_from_slice(&entry.identifier().to_le_bytes());
+            let value_length = u16::try_from(entry.value().len()).unwrap_or(u16::MAX);
+            out.extend_from_slice(&value_length.to_le_bytes());
+            out.extend_from_slice(entry.value());
+        }
+        out
+    }
+
+    /// Returns the negotiated protocol version.
+    #[must_use]
+    pub const fn negotiated_protocol_version(&self) -> u16 {
+        self.negotiated_protocol_version
+    }
+
+    /// Returns the negotiated maximum frame size.
+    #[must_use]
+    pub const fn negotiated_maximum_frame_size(&self) -> u32 {
+        self.negotiated_maximum_frame_size
+    }
+
+    /// Returns the negotiated maximum metadata size.
+    #[must_use]
+    pub const fn negotiated_maximum_metadata_size(&self) -> u16 {
+        self.negotiated_maximum_metadata_size
+    }
+
+    /// Returns the declared accepted capability count.
+    #[must_use]
+    pub const fn accepted_capability_count(&self) -> u16 {
+        self.accepted_capability_count
+    }
+
+    /// Returns the accepted capability entries.
+    #[must_use]
+    pub const fn accepted_capability_entries(&self) -> &CapabilityEntries<'a> {
+        &self.accepted_capability_entries
+    }
+
+    /// Returns the size bounds the response puts in force.
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
+        Limits {
+            frame_size: self.negotiated_maximum_frame_size as u64,
+            metadata_size: self.negotiated_maximum_metadata_size,
+        }
+    }
+}
+
 /// The payload of an admitted frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Payload<'a> {
@@ -616,20 +1042,23 @@ impl std::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
-/// Decodes one frame from the head of `input`.
+/// Decodes one frame from the head of `input` under a connection context.
 ///
-/// The `in_flight` slice holds the request ids in flight at the receiver and
-/// is read by the correlation checks.
+/// The `in_flight` slice of the admission holds the request ids in flight at
+/// the receiver and is read by the correlation checks.
 #[must_use]
-pub fn decode<'a>(input: &'a [u8], role: Role, in_flight: &[u64]) -> Step<'a> {
-    let admitted = match admit(input, role) {
+pub fn decode<'a>(input: &'a [u8], admission: Admission<'_>) -> Step<'a> {
+    let admitted = match admit(input, admission.role, admission.limits) {
         Ok(admitted) => admitted,
         Err(step) => return step,
     };
     let raw = admitted.raw;
     let kind = admitted.kind;
     let total_len = admitted.total_len;
-    let correlation = match correlate(kind, raw.code, raw.request_id, in_flight) {
+    if let Err(failure) = check_connection_state(admission.state, kind, raw.code) {
+        return step_for(failure, total_len, input.len());
+    }
+    let correlation = match correlate(kind, raw.code, raw.request_id, admission.in_flight) {
         Ok(correlation) => correlation,
         Err(failure) => return step_for(failure, total_len, input.len()),
     };
@@ -672,7 +1101,7 @@ struct Admitted<'a> {
 
 /// Runs the frame admission checks from the header through the direction
 /// check, returning the frame's total length and parsed metadata region.
-fn admit(input: &[u8], role: Role) -> Result<Admitted<'_>, Step<'_>> {
+fn admit(input: &[u8], role: Role, limits: Limits) -> Result<Admitted<'_>, Step<'_>> {
     let Some(raw) = RawHeader::parse(input) else {
         return Err(Step::Need(HEADER_LENGTH));
     };
@@ -694,7 +1123,7 @@ fn admit(input: &[u8], role: Role) -> Result<Admitted<'_>, Step<'_>> {
             consumed: input.len(),
         });
     };
-    if frame_total > MAX_FRAME_SIZE {
+    if frame_total > limits.frame_size {
         return Err(Step::Failure {
             failure: Failure::resource_limit(),
             consumed: input.len(),
@@ -706,7 +1135,7 @@ fn admit(input: &[u8], role: Role) -> Result<Admitted<'_>, Step<'_>> {
             consumed: input.len(),
         });
     }
-    if raw.metadata_length > MAX_METADATA_SIZE {
+    if raw.metadata_length > limits.metadata_size {
         return Err(Step::Failure {
             failure: Failure::malformed_request(),
             consumed: input.len(),
@@ -797,6 +1226,8 @@ pub fn encode(outgoing: &Outgoing<'_>) -> Result<Vec<u8>, EncodeError> {
 /// The decision the `code` and correlation checks produce for one frame.
 #[derive(Debug, Clone, Copy)]
 enum Correlation {
+    /// A request frame carrying the handshake opcode.
+    HandshakeRequest,
     /// A response frame carrying an assigned result code.
     Response(ResultCode),
     /// An error frame carrying an assigned class of this scope.
@@ -847,6 +1278,38 @@ fn step_for<'a>(failure: Failure, total_len: usize, input_len: usize) -> Step<'a
     Step::Failure { failure, consumed }
 }
 
+/// Applies the connection-state rule to an admitted frame's kind and code.
+///
+/// The check runs before the opcode assignment, so a frame the connection
+/// state forbids is a protocol violation rather than the class its code alone
+/// would produce.
+const fn check_connection_state(
+    state: ConnectionState,
+    kind: Kind,
+    code: u16,
+) -> Result<(), Failure> {
+    let is_handshake = matches!(kind, Kind::Request) && code == HANDSHAKE_OPCODE;
+    match state {
+        ConnectionState::PreNegotiation => {
+            let responder_terminal =
+                (matches!(kind, Kind::Response) && code == 0) || matches!(kind, Kind::Error);
+            if is_handshake || responder_terminal {
+                Ok(())
+            } else {
+                Err(Failure::protocol_violation())
+            }
+        }
+        ConnectionState::Negotiated => {
+            if is_handshake {
+                Err(Failure::protocol_violation())
+            } else {
+                Ok(())
+            }
+        }
+        ConnectionState::Terminal => Err(Failure::protocol_violation()),
+    }
+}
+
 /// Runs the code and correlation checks that follow the direction check.
 fn correlate(
     kind: Kind,
@@ -862,7 +1325,11 @@ fn correlate(
             if in_flight.contains(&request_id) {
                 return Err(Failure::protocol_violation());
             }
-            Err(Failure::unsupported_operation())
+            if code == HANDSHAKE_OPCODE {
+                Ok(Correlation::HandshakeRequest)
+            } else {
+                Err(Failure::unsupported_operation())
+            }
         }
         Kind::Response => {
             if request_id == 0 {
@@ -914,7 +1381,9 @@ fn read_payload(
     payload: &[u8],
 ) -> Result<Payload<'_>, Failure> {
     match correlation {
-        Correlation::Response(ResultCode::Success) => Ok(Payload::Opaque(payload)),
+        Correlation::HandshakeRequest | Correlation::Response(ResultCode::Success) => {
+            Ok(Payload::Opaque(payload))
+        }
         Correlation::Response(ResultCode::Absent) => {
             if payload_length != 0 {
                 return Err(Failure::malformed_request());
@@ -1063,6 +1532,18 @@ mod tests {
         encode(&outgoing).unwrap_or_default()
     }
 
+    fn decode_at<'a>(input: &'a [u8], role: Role, in_flight: &[u64]) -> Step<'a> {
+        decode(
+            input,
+            Admission {
+                role,
+                state: ConnectionState::Negotiated,
+                limits: Limits::PRE_NEGOTIATION,
+                in_flight,
+            },
+        )
+    }
+
     #[test]
     fn assigned_kinds_convert_and_unassigned_kinds_refuse() {
         assert_eq!(Kind::from_wire(1), Some(Kind::Request));
@@ -1166,7 +1647,7 @@ mod tests {
     #[test]
     fn reserved_request_id_is_refused_on_a_frame_that_names_a_request() {
         let bytes = from_hex("0002000000000000000000000000000000000000");
-        match decode(&bytes, Role::Client, &[]) {
+        match decode_at(&bytes, Role::Client, &[]) {
             Step::Failure { failure, .. } => {
                 assert_eq!(failure.class(), ErrorClass::ProtocolViolation);
                 assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
@@ -1178,7 +1659,7 @@ mod tests {
     #[test]
     fn fatal_class_error_frame_allows_the_reserved_request_id() {
         let bytes = from_hex("000300000c0000000200000000000000000000000000");
-        let step = decode(&bytes, Role::Client, &[]);
+        let step = decode_at(&bytes, Role::Client, &[]);
         assert!(
             matches!(&step, Step::Frame(_)),
             "expected frame, got {step:?}"
@@ -1199,7 +1680,7 @@ mod tests {
     #[test]
     fn metadata_ascending_entries_admit() {
         let bytes = frame_with_metadata(&[(1, &[]), (2, &[0xff])]);
-        let step = decode(&bytes, Role::Client, &[1]);
+        let step = decode_at(&bytes, Role::Client, &[1]);
         assert!(
             matches!(&step, Step::Frame(_)),
             "expected frame, got {step:?}"
@@ -1220,7 +1701,7 @@ mod tests {
             "00020000000008000000000001000000000000000200000001000000",
         ] {
             let bytes = from_hex(text);
-            match decode(&bytes, Role::Client, &[1]) {
+            match decode_at(&bytes, Role::Client, &[1]) {
                 Step::Failure { failure, consumed } => {
                     assert_eq!(failure.class(), ErrorClass::InvalidArgument);
                     assert_eq!(failure.scope(), FailureScope::RequestScoped);
@@ -1234,7 +1715,7 @@ mod tests {
     #[test]
     fn metadata_region_must_fill_exactly() {
         let bytes = from_hex("0002000000000600000000000100000000000000010000000200");
-        match decode(&bytes, Role::Client, &[1]) {
+        match decode_at(&bytes, Role::Client, &[1]) {
             Step::Failure { failure, .. } => {
                 assert_eq!(failure.class(), ErrorClass::MalformedRequest);
                 assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
@@ -1246,7 +1727,7 @@ mod tests {
     #[test]
     fn unassigned_optional_identifier_is_skipped() {
         let bytes = from_hex("000200000000070000000000010000000000000001000300aabbcc");
-        let step = decode(&bytes, Role::Client, &[1]);
+        let step = decode_at(&bytes, Role::Client, &[1]);
         assert!(
             matches!(&step, Step::Frame(_)),
             "expected frame, got {step:?}"
@@ -1256,7 +1737,7 @@ mod tests {
     #[test]
     fn unassigned_required_identifier_is_refused() {
         let bytes = from_hex("000200000000040000000000010000000000000000800000");
-        match decode(&bytes, Role::Client, &[1]) {
+        match decode_at(&bytes, Role::Client, &[1]) {
             Step::Failure { failure, consumed } => {
                 assert_eq!(failure.class(), ErrorClass::InvalidArgument);
                 assert_eq!(failure.scope(), FailureScope::RequestScoped);
@@ -1278,7 +1759,7 @@ mod tests {
     #[test]
     fn minimal_response_decodes() {
         let bytes = from_hex("0002000000000000000000000100000000000000");
-        let step = decode(&bytes, Role::Client, &[1]);
+        let step = decode_at(&bytes, Role::Client, &[1]);
         assert!(
             matches!(&step, Step::Frame(_)),
             "expected frame, got {step:?}"
@@ -1295,11 +1776,14 @@ mod tests {
     fn fragmented_input_returns_need() {
         let bytes = from_hex("0002000000000000000000000100000000000000");
         let short = bytes.get(..10).unwrap_or(&bytes);
-        assert!(matches!(decode(short, Role::Client, &[1]), Step::Need(20)));
+        assert!(matches!(
+            decode_at(short, Role::Client, &[1]),
+            Step::Need(20)
+        ));
         let body = from_hex("0002000000000300000000000100000000000000aabbcc");
         let truncated = body.get(..body.len().saturating_sub(1)).unwrap_or(&body);
         assert!(matches!(
-            decode(truncated, Role::Client, &[1]),
+            decode_at(truncated, Role::Client, &[1]),
             Step::Need(23)
         ));
     }
@@ -1358,7 +1842,7 @@ mod tests {
         ];
         for outgoing in cases {
             let bytes = encode(&outgoing)?;
-            let step = decode(&bytes, Role::Client, &[1]);
+            let step = decode_at(&bytes, Role::Client, &[1]);
             assert!(
                 matches!(&step, Step::Frame(_)),
                 "round trip failed: {step:?}"

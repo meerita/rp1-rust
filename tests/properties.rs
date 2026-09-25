@@ -40,6 +40,19 @@ impl Rng {
     }
 }
 
+/// Decodes under the negotiated state and the pre-negotiation bounds.
+fn decode_at<'a>(bytes: &'a [u8], role: Role, in_flight: &[u64]) -> Step<'a> {
+    protocol::decode(
+        bytes,
+        protocol::Admission {
+            role,
+            state: protocol::ConnectionState::Negotiated,
+            limits: protocol::Limits::PRE_NEGOTIATION,
+            in_flight,
+        },
+    )
+}
+
 /// Encodes a minimal response for the given request id.
 fn response(request_id: u64, payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let outgoing = Outgoing {
@@ -67,20 +80,20 @@ fn arbitrary_bytes_never_panic_the_decoder() {
         } else {
             Role::Server
         };
-        let _ = protocol::decode(&bytes, role, &in_flight);
+        let _ = decode_at(&bytes, role, &in_flight);
     }
 }
 
 #[test]
 fn arbitrary_fragmentation_preserves_the_frame() -> Result<(), Box<dyn Error>> {
     let bytes = response(7, &[1, 2, 3])?;
-    let whole = match protocol::decode(&bytes, Role::Client, &[7]) {
+    let whole = match decode_at(&bytes, Role::Client, &[7]) {
         Step::Frame(frame) => frame,
         other => return Err(format!("full frame did not decode: {other:?}").into()),
     };
     for end in 1..bytes.len() {
         let prefix = bytes.get(..end).ok_or("prefix out of range")?;
-        match protocol::decode(prefix, Role::Client, &[7]) {
+        match decode_at(prefix, Role::Client, &[7]) {
             Step::Need(required) => assert!(
                 required >= end,
                 "a prefix of {end} bytes asked for only {required}"
@@ -103,14 +116,14 @@ fn concatenated_frames_decode_in_order() -> Result<(), Box<dyn Error>> {
     stream.extend_from_slice(&response(2, b"hello")?);
     let mut remaining = stream.as_slice();
 
-    let first = match protocol::decode(remaining, Role::Client, &[1, 2]) {
+    let first = match decode_at(remaining, Role::Client, &[1, 2]) {
         Step::Frame(frame) => frame,
         other => return Err(format!("first frame did not decode: {other:?}").into()),
     };
     assert_eq!(first.header().request_id().value(), 1);
 
     remaining = remaining.get(first_len..).ok_or("remaining out of range")?;
-    let second = match protocol::decode(remaining, Role::Client, &[1, 2]) {
+    let second = match decode_at(remaining, Role::Client, &[1, 2]) {
         Step::Frame(frame) => frame,
         other => return Err(format!("second frame did not decode: {other:?}").into()),
     };
@@ -132,7 +145,7 @@ fn every_generated_frame_round_trips() -> Result<(), Box<dyn Error>> {
             payload.push(rng.byte());
         }
         let bytes = response(request_id, &payload)?;
-        match protocol::decode(&bytes, Role::Client, &[request_id]) {
+        match decode_at(&bytes, Role::Client, &[request_id]) {
             Step::Frame(frame) => {
                 assert_eq!(frame.header().request_id().value(), request_id);
                 assert_eq!(frame.payload(), &protocol::Payload::Opaque(&payload));
@@ -152,7 +165,7 @@ fn every_refusal_carries_a_class_and_a_scope() {
         for _ in 0..length {
             bytes.push(rng.byte());
         }
-        if let Step::Failure { failure, .. } = protocol::decode(&bytes, Role::Client, &[1]) {
+        if let Step::Failure { failure, .. } = decode_at(&bytes, Role::Client, &[1]) {
             let _ = failure.class().name();
             let _ = failure.scope().name();
         }
