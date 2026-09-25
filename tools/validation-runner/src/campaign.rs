@@ -216,8 +216,11 @@ const LINT_ALLOWANCE_CHECK: &str = concat!(
 /// Fails when a tracked manifest declares a path dependency that leaves the
 /// repository. A dependency outside the checkout cannot be resolved from a
 /// clean clone, and it is the shape a private dependency would take.
+///
+/// The fuzz workspace is excluded. It is not part of the published graph,
+/// and its dependency on the crate points at the repository root.
 const LOCAL_PATH_CHECK: &str = concat!(
-    "if git ls-files -z '*Cargo.toml' | xargs -0 grep -lE ",
+    "if git ls-files -z -- '*Cargo.toml' ':(exclude)fuzz/*' | xargs -0 grep -lE ",
     "'path[[:space:]]*=[[:space:]]*\"[^\"]*[.][.]'; then ",
     "echo 'a manifest declares a path dependency that leaves the repository'; ",
     "exit 1; fi"
