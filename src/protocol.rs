@@ -624,6 +624,24 @@ impl<'a> HandshakeRequest<'a> {
     /// The fixed length of the request head in bytes.
     pub const HEAD_LENGTH: usize = 10;
 
+    /// Builds a handshake request from its parts.
+    #[must_use]
+    pub fn new(
+        client_maximum_protocol_version: u16,
+        client_minimum_protocol_version: u16,
+        client_desired_maximum_frame_size: u32,
+        capability_entries: CapabilityEntries<'a>,
+    ) -> Self {
+        let capability_count = u16::try_from(capability_entries.count()).unwrap_or(u16::MAX);
+        Self {
+            client_maximum_protocol_version,
+            client_minimum_protocol_version,
+            client_desired_maximum_frame_size,
+            capability_count,
+            capability_entries,
+        }
+    }
+
     /// Decodes and validates a handshake request payload as untrusted input.
     ///
     /// # Errors

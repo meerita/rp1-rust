@@ -6,6 +6,13 @@
 //!
 //! This crate is in early development. It exposes a low-level protocol
 //! module that implements the `rp1-spec` `v0.4.0` framing, codec, handshake,
-//! and negotiation contract. It still has no client API and no transport.
+//! and negotiation contract, and a connection surface that opens a usable
+//! protocol version 0 connection through the handshake. It runs no command
+//! yet.
 
+pub mod connection;
 pub mod protocol;
+
+mod transport;
+
+pub use connection::{ConnectError, Connection, ConnectionConfig, ConnectionConfigError};
