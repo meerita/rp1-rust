@@ -2,8 +2,8 @@
 //!
 //! A connection becomes usable only after the handshake completes. This
 //! module owns the public configuration, the connect path, the handshake
-//! exchange as untrusted input, and the negotiated session state the
-//! connection exposes.
+//! exchange as untrusted input, the negotiated session state the
+//! connection exposes, and the explicit lifecycle state of the connection.
 //!
 //! It owns no command surface. A connection negotiates and closes; it runs
 //! no operation.
@@ -11,8 +11,8 @@
 use std::fmt;
 
 use crate::protocol::{
-    self, Admission, CapabilityEntries, ConnectionState, ErrorClass, Failure, HANDSHAKE_OPCODE,
-    HandshakeOffer, HandshakeRequest, HandshakeResponse, Kind, Limits, MAX_FRAME_SIZE,
+    self, Admission, CapabilityEntries, ErrorClass, Failure, HANDSHAKE_OPCODE, HandshakeOffer,
+    HandshakeRequest, HandshakeResponse, Kind, Limits, MAX_FRAME_SIZE,
     MINIMUM_NEGOTIATED_FRAME_SIZE, Outgoing, OutgoingPayload, Payload, Role, Step,
 };
 use crate::transport::{AnyTransport, TokioTransport};
@@ -184,12 +184,51 @@ struct Negotiated {
 }
 
 /// The lifecycle state of a connection.
+///
+/// A connection is usable only after the handshake completes. Closing runs
+/// while an explicit shutdown is in progress. Closed, failed, and unusable
+/// are terminal: a connection that reaches one never becomes usable again.
+///
+/// The states map onto the protocol connection states as follows: usable
+/// and closing are the negotiated state, and closed, failed, and unusable
+/// are the terminal state. The three terminal states keep why the session
+/// ended: closed after an orderly shutdown, failed after a transport
+/// failure, unusable after a failure that made continued protocol
+/// operation unsafe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lifecycle {
-    /// The handshake completed and the connection is usable.
-    Negotiated,
-    /// The connection was closed.
+#[non_exhaustive]
+pub enum ConnectionState {
+    /// The handshake completed and the connection accepts no new work yet
+    /// runs no command; it is open and has not entered shutdown or failure.
+    Usable,
+    /// An explicit shutdown started and the transport close is pending.
+    Closing,
+    /// An orderly shutdown completed.
     Closed,
+    /// The transport failed.
+    Failed,
+    /// Continued protocol operation became unsafe. The establishment path
+    /// reports such a failure through [`ConnectError`] and returns no
+    /// connection, so this state is first reached by failures detected
+    /// after establishment.
+    Unusable,
+}
+
+impl ConnectionState {
+    /// Returns the protocol connection state this lifecycle state occupies.
+    #[must_use]
+    pub const fn protocol_state(self) -> protocol::ConnectionState {
+        match self {
+            Self::Usable | Self::Closing => protocol::ConnectionState::Negotiated,
+            Self::Closed | Self::Failed | Self::Unusable => protocol::ConnectionState::Terminal,
+        }
+    }
+
+    /// Returns whether the connection is usable.
+    #[must_use]
+    pub const fn is_usable(self) -> bool {
+        matches!(self, Self::Usable)
+    }
 }
 
 /// A usable protocol version 0 connection.
@@ -197,11 +236,16 @@ enum Lifecycle {
 /// A `Connection` is returned only after the handshake completes. It owns
 /// its transport and its negotiated session state. It exposes no command;
 /// a later revision adds the command surface.
+///
+/// Dropping a `Connection` without calling [`Connection::close`] closes
+/// the transport without waiting and releases local resources. It sends
+/// no protocol exchange and rolls nothing back. Callers that need a
+/// deterministic shutdown call `close`.
 #[derive(Debug)]
 pub struct Connection {
     transport: AnyTransport,
     negotiated: Negotiated,
-    lifecycle: Lifecycle,
+    state: ConnectionState,
 }
 
 impl Connection {
@@ -237,7 +281,7 @@ impl Connection {
         Ok(Self {
             transport,
             negotiated,
-            lifecycle: Lifecycle::Negotiated,
+            state: ConnectionState::Usable,
         })
     }
 
@@ -265,20 +309,45 @@ impl Connection {
         &self.negotiated.accepted_capabilities
     }
 
+    /// Returns the lifecycle state of the connection.
+    #[must_use]
+    pub const fn state(&self) -> ConnectionState {
+        self.state
+    }
+
     /// Returns whether the connection is usable. This is false after close.
     #[must_use]
     pub const fn is_usable(&self) -> bool {
-        matches!(self.lifecycle, Lifecycle::Negotiated)
+        self.state.is_usable()
     }
 
     /// Closes the connection.
     ///
+    /// Closing stops admission, shuts the transport down, and moves the
+    /// connection to [`ConnectionState::Closed`]. When the transport
+    /// shutdown fails, the connection moves to [`ConnectionState::Failed`]
+    /// instead and the error is returned. Closing an already closed
+    /// connection succeeds without touching the transport.
+    ///
     /// # Errors
     ///
-    /// Returns the underlying transport error.
-    pub async fn close(mut self) -> Result<(), std::io::Error> {
-        self.lifecycle = Lifecycle::Closed;
-        self.transport.shutdown().await
+    /// Returns the underlying transport error, leaving the connection in
+    /// the failed state.
+    pub async fn close(&mut self) -> Result<(), std::io::Error> {
+        if self.state == ConnectionState::Closed {
+            return Ok(());
+        }
+        self.state = ConnectionState::Closing;
+        match self.transport.shutdown().await {
+            Ok(()) => {
+                self.state = ConnectionState::Closed;
+                Ok(())
+            }
+            Err(error) => {
+                self.state = ConnectionState::Failed;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -333,7 +402,7 @@ async fn read_handshake_response(transport: &mut AnyTransport) -> Result<Negotia
     loop {
         let admission = Admission {
             role: Role::Client,
-            state: ConnectionState::PreNegotiation,
+            state: protocol::ConnectionState::PreNegotiation,
             limits: Limits::PRE_NEGOTIATION,
             in_flight: &[HANDSHAKE_REQUEST_ID],
         };
@@ -444,6 +513,74 @@ mod tests {
     }
 
     #[test]
+    fn the_lifecycle_states_map_onto_the_protocol_states() {
+        use crate::protocol::ConnectionState as ProtocolState;
+        assert_eq!(
+            ConnectionState::Usable.protocol_state(),
+            ProtocolState::Negotiated
+        );
+        assert_eq!(
+            ConnectionState::Closing.protocol_state(),
+            ProtocolState::Negotiated
+        );
+        assert_eq!(
+            ConnectionState::Closed.protocol_state(),
+            ProtocolState::Terminal
+        );
+        assert_eq!(
+            ConnectionState::Failed.protocol_state(),
+            ProtocolState::Terminal
+        );
+        assert_eq!(
+            ConnectionState::Unusable.protocol_state(),
+            ProtocolState::Terminal
+        );
+        assert!(ConnectionState::Usable.is_usable());
+        assert!(!ConnectionState::Closing.is_usable());
+        assert!(!ConnectionState::Closed.is_usable());
+        assert!(!ConnectionState::Failed.is_usable());
+        assert!(!ConnectionState::Unusable.is_usable());
+    }
+
+    #[tokio::test]
+    async fn close_moves_a_usable_connection_to_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let mut connection = Connection::establish(transport, &config).await?;
+        assert_eq!(connection.state(), ConnectionState::Usable);
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        assert!(!connection.is_usable());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_close_succeeds_without_touching_the_transport()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let mut connection = Connection::establish(transport, &config).await?;
+        connection.close().await?;
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_shutdown_moves_the_connection_to_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let inbound = response_frame(0, 65_536, 4_096, &[]);
+        let transport =
+            AnyTransport::Memory(InMemoryTransport::new(&inbound, 4_096, 4_096).fail_on_shutdown());
+        let mut connection = Connection::establish(transport, &config).await?;
+        assert!(connection.close().await.is_err());
+        assert_eq!(connection.state(), ConnectionState::Failed);
+        assert!(!connection.is_usable());
+        Ok(())
+    }
+
+    #[test]
     fn an_empty_endpoint_is_refused() {
         let config = ConnectionConfig::new("   ");
         assert_eq!(config.validate(), Err(ConnectionConfigError::EmptyEndpoint));
@@ -487,6 +624,7 @@ mod tests {
         assert_eq!(connection.maximum_frame_size(), 65_536);
         assert_eq!(connection.maximum_metadata_size(), 4_096);
         assert!(connection.accepted_capabilities().is_empty());
+        assert_eq!(connection.state(), ConnectionState::Usable);
         assert!(connection.is_usable());
         Ok(())
     }

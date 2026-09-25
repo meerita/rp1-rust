@@ -15,4 +15,6 @@ pub mod protocol;
 
 mod transport;
 
-pub use connection::{ConnectError, Connection, ConnectionConfig, ConnectionConfigError};
+pub use connection::{
+    ConnectError, Connection, ConnectionConfig, ConnectionConfigError, ConnectionState,
+};

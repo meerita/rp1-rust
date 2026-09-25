@@ -9,6 +9,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A public `ConnectionState` with the `Usable`, `Closing`, `Closed`,
+  `Failed`, and `Unusable` lifecycle states. Usable and closing occupy the
+  negotiated protocol state; closed, failed, and unusable occupy the
+  terminal state. `Connection::state` reports the current state, and
+  `Connection::close` borrows the connection, moves it through closing to
+  closed on an orderly shutdown or to failed when the transport shutdown
+  fails, and succeeds without effect when the connection is already
+  closed. Dropping a connection without closing it closes the transport
+  without waiting and releases local resources.
 - A public `ConnectionConfig` and `Connection` with an asynchronous
   `connect` that opens a transport, sends the handshake request as the
   first frame, validates the response as untrusted input, and returns a

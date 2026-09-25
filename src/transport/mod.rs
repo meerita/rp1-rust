@@ -79,6 +79,7 @@ pub struct InMemoryTransport {
     written: Vec<u8>,
     write_step: usize,
     closed: bool,
+    fail_shutdown: bool,
 }
 
 #[cfg(test)]
@@ -92,7 +93,14 @@ impl InMemoryTransport {
             written: Vec::new(),
             write_step,
             closed: false,
+            fail_shutdown: false,
         }
+    }
+
+    /// Makes the next shutdown fail, so tests can drive the failed state.
+    pub const fn fail_on_shutdown(mut self) -> Self {
+        self.fail_shutdown = true;
+        self
     }
 
     /// Returns the bytes written so far.
@@ -127,7 +135,11 @@ impl Transport for InMemoryTransport {
 
     fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> {
         self.closed = true;
-        std::future::ready(Ok(()))
+        if self.fail_shutdown {
+            std::future::ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")))
+        } else {
+            std::future::ready(Ok(()))
+        }
     }
 }
 

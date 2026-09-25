@@ -44,7 +44,7 @@ async fn connect_completes_against_a_fragmenting_peer() -> Result<(), Box<dyn Er
     });
 
     let config = ConnectionConfig::new(address.to_string());
-    let connection = Connection::connect(&config).await?;
+    let mut connection = Connection::connect(&config).await?;
     assert_eq!(connection.protocol_version(), 0);
     assert_eq!(connection.maximum_frame_size(), 65_536);
     assert_eq!(connection.maximum_metadata_size(), 4_096);
