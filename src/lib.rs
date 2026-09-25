@@ -4,5 +4,8 @@
 //! The public RP-1 protocol specification is the contract this crate
 //! implements.
 //!
-//! This crate is in early development and exports no items yet. The
-//! client API, the protocol types, and the transport are not implemented.
+//! This crate is in early development. It exposes a low-level protocol
+//! module that implements the `rp1-spec` `v0.2.0` framing and codec
+//! contract. It still has no client API and no transport.
+
+pub mod protocol;

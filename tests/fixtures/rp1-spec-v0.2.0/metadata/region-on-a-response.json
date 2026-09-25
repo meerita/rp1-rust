@@ -1,0 +1,31 @@
+{
+  "id": "metadata/region-on-a-response",
+  "revision": "v0.2.0",
+  "protocol_version": 0,
+  "clause": "The Metadata Region",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00020000000005000000000004000000000000001000010001",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 2,
+      "flags": 0,
+      "code": 0,
+      "metadata_length": 5,
+      "payload_length": 0,
+      "request_id": "4",
+      "metadata": [
+        {
+          "identifier": 16,
+          "value": "01"
+        }
+      ]
+    },
+    "bytes_consumed": 25
+  }
+}

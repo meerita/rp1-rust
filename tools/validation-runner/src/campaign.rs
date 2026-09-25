@@ -84,6 +84,13 @@ impl SegmentDefinition {
 
 /// Every segment this runner knows how to execute.
 pub fn definition() -> Vec<SegmentDefinition> {
+    let mut segments = core_segments();
+    segments.extend(evidence_segments());
+    segments
+}
+
+/// The segments that compile, test, and audit the workspace and the codec.
+fn core_segments() -> Vec<SegmentDefinition> {
     vec![
         SegmentDefinition {
             id: "build-and-lint",
@@ -103,6 +110,16 @@ pub fn definition() -> Vec<SegmentDefinition> {
             tiers: &[Tier::Dev, Tier::Gate],
             prerequisite: None,
             steps: vec![Step::new("cargo", &["test", "--workspace"])],
+        },
+        SegmentDefinition {
+            id: "spec-fixtures",
+            purpose: "the vendored public specification fixture corpus passes",
+            tiers: &[Tier::Dev, Tier::Gate],
+            prerequisite: None,
+            steps: vec![Step::new(
+                "cargo",
+                &["test", "--package", "rp1db", "--test", "spec_fixtures"],
+            )],
         },
         SegmentDefinition {
             id: "msrv",
@@ -130,6 +147,12 @@ pub fn definition() -> Vec<SegmentDefinition> {
                 Step::new("/bin/sh", &["-c", LOCAL_PATH_CHECK]),
             ],
         },
+    ]
+}
+
+/// The segments that check evidence, documentation, fuzzing, and independence.
+fn evidence_segments() -> Vec<SegmentDefinition> {
+    vec![
         SegmentDefinition {
             id: "package-contents",
             purpose: "the published package carries the intended files and nothing else",
@@ -153,6 +176,27 @@ pub fn definition() -> Vec<SegmentDefinition> {
             tiers: &[Tier::Dev, Tier::Gate],
             prerequisite: None,
             steps: vec![Step::new("cargo", &["doc", "--no-deps", "--workspace"])],
+        },
+        SegmentDefinition {
+            id: "fuzz-frame-decoder",
+            purpose: "the frame decoder survives a bounded fuzzing run",
+            tiers: &[Tier::Dev, Tier::Gate],
+            prerequisite: Some(Prerequisite {
+                probe: Step::new("cargo", &["fuzz", "--version"]),
+                remedy: "install it with `cargo install cargo-fuzz`".to_owned(),
+            }),
+            steps: vec![Step::new(
+                "cargo",
+                &[
+                    "+nightly",
+                    "fuzz",
+                    "run",
+                    "frame_decode",
+                    "--",
+                    "-runs=10000",
+                    "-max_total_time=45",
+                ],
+            )],
         },
         SegmentDefinition {
             id: "clean-clone",
@@ -206,8 +250,11 @@ const LINT_ALLOWANCE_CHECK: &str = concat!(
 /// Fails when a tracked manifest declares a path dependency that leaves the
 /// repository. A dependency outside the checkout cannot be resolved from a
 /// clean clone, and it is the shape a private dependency would take.
+///
+/// The fuzz workspace is excluded. It is not part of the published graph,
+/// and its dependency on the crate points at the repository root.
 const LOCAL_PATH_CHECK: &str = concat!(
-    "if git ls-files -z '*Cargo.toml' | xargs -0 grep -lE ",
+    "if git ls-files -z -- '*Cargo.toml' ':(exclude)fuzz/*' | xargs -0 grep -lE ",
     "'path[[:space:]]*=[[:space:]]*\"[^\"]*[.][.]'; then ",
     "echo 'a manifest declares a path dependency that leaves the repository'; ",
     "exit 1; fi"
@@ -925,10 +972,12 @@ mod tests {
             vec![
                 "build-and-lint",
                 "unit-tests",
+                "spec-fixtures",
                 "msrv",
                 "deps",
                 "no-internal-references",
-                "docs"
+                "docs",
+                "fuzz-frame-decoder"
             ]
         );
 
@@ -942,11 +991,13 @@ mod tests {
             vec![
                 "build-and-lint",
                 "unit-tests",
+                "spec-fixtures",
                 "msrv",
                 "deps",
                 "package-contents",
                 "no-internal-references",
                 "docs",
+                "fuzz-frame-decoder",
                 "clean-clone"
             ]
         );

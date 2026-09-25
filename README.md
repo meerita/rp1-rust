@@ -11,8 +11,15 @@ The crate is published as `rp1db`.
 Early development.
 
 The repository builds, tests, lints, and packages the crate. The crate
-itself exposes no public API. There is no connection, no command surface,
-and no protocol implementation in it yet.
+exposes a low-level `protocol` module that implements the framing and
+codec contract of the public RP-1 protocol specification, revision
+`v0.2.0`: validated wire types, an incremental decoder, an encoder, and
+the frame admission order. Its behavior is checked against the published
+fixture corpus.
+
+The crate exposes no client API. There is no connection, no negotiation,
+and no command surface, because revision `v0.2.0` defines no exchange and
+assigns no opcode.
 
 Do not add `rp1db` to a project that needs a working client. This version
 cannot talk to an RP-1 server.
@@ -58,8 +65,9 @@ when it is absent.
 The public RP-1 protocol specification is the contract this client
 implements. It is the authority for wire behavior.
 
-API documentation and compatibility information will be published here
-when the client implements the protocol.
+The `protocol` module is documented as a low-level surface. Client API
+documentation and compatibility information will be published when the
+client implements the protocol.
 
 ## Contributing
 

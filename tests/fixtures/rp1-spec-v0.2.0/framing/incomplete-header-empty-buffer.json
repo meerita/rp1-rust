@@ -1,0 +1,15 @@
+{
+  "id": "framing/incomplete-header-empty-buffer",
+  "revision": "v0.2.0",
+  "protocol_version": 0,
+  "clause": "Frame Admission Order",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": ""
+  },
+  "expect": {
+    "outcome": "incomplete",
+    "bytes_required": 20
+  }
+}

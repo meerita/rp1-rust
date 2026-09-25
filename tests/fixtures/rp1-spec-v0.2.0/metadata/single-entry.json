@@ -1,0 +1,31 @@
+{
+  "id": "metadata/single-entry",
+  "revision": "v0.2.0",
+  "protocol_version": 0,
+  "clause": "The Entry Layout",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000000000600000000000100000000000000010002000a0b",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 2,
+      "flags": 0,
+      "code": 0,
+      "metadata_length": 6,
+      "payload_length": 0,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 1,
+          "value": "0a0b"
+        }
+      ]
+    },
+    "bytes_consumed": 26
+  }
+}
