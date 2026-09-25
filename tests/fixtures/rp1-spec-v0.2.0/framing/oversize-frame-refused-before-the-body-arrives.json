@@ -1,0 +1,17 @@
+{
+  "id": "framing/oversize-frame-refused-before-the-body-arrives",
+  "revision": "v0.2.0",
+  "protocol_version": 0,
+  "clause": "Frame Admission Order",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "000100000000000040420f000100000000000000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "resource limit",
+    "scope": "connection-fatal"
+  }
+}

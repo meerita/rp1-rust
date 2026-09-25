@@ -105,6 +105,16 @@ pub fn definition() -> Vec<SegmentDefinition> {
             steps: vec![Step::new("cargo", &["test", "--workspace"])],
         },
         SegmentDefinition {
+            id: "spec-fixtures",
+            purpose: "the vendored public specification fixture corpus passes",
+            tiers: &[Tier::Dev, Tier::Gate],
+            prerequisite: None,
+            steps: vec![Step::new(
+                "cargo",
+                &["test", "--package", "rp1db", "--test", "spec_fixtures"],
+            )],
+        },
+        SegmentDefinition {
             id: "msrv",
             purpose: "the published crate compiles on its declared minimum Rust version",
             tiers: &[Tier::Dev, Tier::Gate],
@@ -925,6 +935,7 @@ mod tests {
             vec![
                 "build-and-lint",
                 "unit-tests",
+                "spec-fixtures",
                 "msrv",
                 "deps",
                 "no-internal-references",
@@ -942,6 +953,7 @@ mod tests {
             vec![
                 "build-and-lint",
                 "unit-tests",
+                "spec-fixtures",
                 "msrv",
                 "deps",
                 "package-contents",

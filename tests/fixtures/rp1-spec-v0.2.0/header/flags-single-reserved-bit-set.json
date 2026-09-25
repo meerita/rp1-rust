@@ -1,0 +1,17 @@
+{
+  "id": "header/flags-single-reserved-bit-set",
+  "revision": "v0.2.0",
+  "protocol_version": 0,
+  "clause": "Flags",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0001010000000000000000000100000000000000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

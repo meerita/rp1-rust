@@ -1,0 +1,34 @@
+{
+  "id": "header/request-id-at-the-maximum",
+  "revision": "v0.2.0",
+  "protocol_version": 0,
+  "clause": "The Reserved Request Id",
+  "direction": "both",
+  "provenance": "derived-from-specification",
+  "input": {
+    "fields": {
+      "version": 0,
+      "kind": 2,
+      "flags": 0,
+      "code": 0,
+      "request_id": "18446744073709551615",
+      "metadata": [],
+      "payload": ""
+    },
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 2,
+      "flags": 0,
+      "code": 0,
+      "metadata_length": 0,
+      "payload_length": 0,
+      "request_id": "18446744073709551615"
+    },
+    "bytes": "000200000000000000000000ffffffffffffffff",
+    "bytes_consumed": 20
+  }
+}
