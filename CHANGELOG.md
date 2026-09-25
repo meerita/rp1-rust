@@ -26,6 +26,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connection exposes the local caps and the effective bounds, the
   stricter of the negotiated and local values, which later request
   admission will read.
+- Connection establishment conformance: the integration suite drives the
+  connection against synthetic TCP peers across stable `B.*` scenarios
+  covering a valid exchange, version and bound negotiation, capability
+  refusal, frames outside the handshake, handshake order and uniqueness,
+  fragmentation, peer close, orderly shutdown, and local-limit refusal.
+  Every scenario states the caller-visible outcome and the
+  connection-state outcome.
 - A public `ConnectionConfig` and `Connection` with an asynchronous
   `connect` that opens a transport, sends the handshake request as the
   first frame, validates the response as untrusted input, and returns a
