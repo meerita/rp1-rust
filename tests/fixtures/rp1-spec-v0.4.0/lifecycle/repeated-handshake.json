@@ -1,0 +1,18 @@
+{
+  "id": "lifecycle/repeated-handshake",
+  "revision": "v0.4.0",
+  "protocol_version": 0,
+  "clause": "After the Handshake",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00010000010000000a000000010000000000000000000000000001000000",
+    "role": "server",
+    "state": "negotiated"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

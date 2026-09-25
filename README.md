@@ -11,18 +11,26 @@ The crate is published as `rp1db`.
 Early development.
 
 The repository builds, tests, lints, and packages the crate. The crate
-exposes a low-level `protocol` module that implements the framing and
-codec contract of the public RP-1 protocol specification, revision
-`v0.2.0`: validated wire types, an incremental decoder, an encoder, and
-the frame admission order. Its behavior is checked against the published
-fixture corpus.
+implements the public RP-1 protocol specification, revision `v0.4.0`:
 
-The crate exposes no client API. There is no connection, no negotiation,
-and no command surface, because revision `v0.2.0` defines no exchange and
-assigns no opcode.
+- A low-level `protocol` module with validated wire types, an incremental
+  decoder that reads under a connection state and the bounds in force, an
+  encoder, the frame admission order, and the handshake request and
+  response payloads. Its behavior is checked against the published 89
+  fixture corpus.
+- A public `ConnectionConfig` and `Connection` with an asynchronous
+  `connect` that opens a TCP connection, sends the handshake request as
+  the first frame, validates the response, and returns a connection only
+  after negotiation completes. A usable connection exposes the negotiated
+  protocol version, the negotiated frame and metadata bounds, and the
+  accepted capability set, and closes explicitly.
+
+The crate exposes no command surface. Revision `v0.4.0` assigns no
+operation beyond the handshake, so a connection connects and runs no
+operation.
 
 Do not add `rp1db` to a project that needs a working client. This version
-cannot talk to an RP-1 server.
+completes the handshake and then runs no command.
 
 ## Supported Rust version
 

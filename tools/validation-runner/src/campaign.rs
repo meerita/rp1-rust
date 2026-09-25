@@ -122,6 +122,16 @@ fn core_segments() -> Vec<SegmentDefinition> {
             )],
         },
         SegmentDefinition {
+            id: "connection",
+            purpose: "the public connection surface completes the handshake",
+            tiers: &[Tier::Dev, Tier::Gate],
+            prerequisite: None,
+            steps: vec![Step::new(
+                "cargo",
+                &["test", "--package", "rp1db", "--test", "connection"],
+            )],
+        },
+        SegmentDefinition {
             id: "msrv",
             purpose: "the published crate compiles on its declared minimum Rust version",
             tiers: &[Tier::Dev, Tier::Gate],
@@ -973,6 +983,7 @@ mod tests {
                 "build-and-lint",
                 "unit-tests",
                 "spec-fixtures",
+                "connection",
                 "msrv",
                 "deps",
                 "no-internal-references",
@@ -992,6 +1003,7 @@ mod tests {
                 "build-and-lint",
                 "unit-tests",
                 "spec-fixtures",
+                "connection",
                 "msrv",
                 "deps",
                 "package-contents",

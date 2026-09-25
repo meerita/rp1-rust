@@ -1,0 +1,17 @@
+{
+  "id": "limits/metadata-length-exceeds-the-frame",
+  "revision": "v0.4.0",
+  "protocol_version": 0,
+  "clause": "The pre-negotiation maximum frame size",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "000100000000ffff000000000100000000000000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "resource limit",
+    "scope": "connection-fatal"
+  }
+}

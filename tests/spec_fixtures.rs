@@ -1,4 +1,4 @@
-//! Runs the vendored `rp1-spec` `v0.2.0` fixture corpus against the protocol
+//! Runs the vendored `rp1-spec` `v0.4.0` fixture corpus against the protocol
 //! codec.
 //!
 //! The corpus is test data. This harness reads every fixture, offers its
@@ -9,19 +9,32 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rp1db::protocol::{self, Frame, Kind, Outgoing, OutgoingPayload, Payload, Role, Step};
+use rp1db::protocol::{
+    self, Admission, CapabilityEntry, ConnectionState, Frame, HandshakeOffer, HandshakeRequest,
+    HandshakeResponse, Kind, Limits, Outgoing, OutgoingPayload, Payload, Role, Step,
+};
+
+/// The protocol versions this implementation supports.
+const SUPPORTED_VERSIONS: &[u16] = &[0];
+
+/// The versions and capabilities this implementation offers.
+const OFFER: HandshakeOffer<'_> = HandshakeOffer {
+    minimum_protocol_version: 0,
+    maximum_protocol_version: 0,
+    capability_ids: &[],
+};
 
 /// Runs every fixture in the vendored corpus.
 #[test]
 fn corpus_conformance() -> Result<(), Box<dyn Error>> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rp1-spec-v0.2.0");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rp1-spec-v0.4.0");
     let mut files = Vec::new();
     collect_json_files(&root, &mut files)?;
     files.sort();
     assert_eq!(
         files.len(),
-        71,
-        "expected 71 fixtures, found {}",
+        89,
+        "expected 89 fixtures, found {}",
         files.len()
     );
     for file in &files {
@@ -56,7 +69,7 @@ fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
         .get("revision")
         .and_then(Json::as_str)
         .ok_or_else(|| format!("fixture {id}: missing revision"))?;
-    assert_eq!(revision, "v0.2.0", "fixture {id}: wrong revision");
+    assert_eq!(revision, "v0.4.0", "fixture {id}: wrong revision");
     let direction = value
         .get("direction")
         .and_then(Json::as_str)
@@ -68,6 +81,8 @@ fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
         .get("expect")
         .ok_or_else(|| format!("fixture {id}: missing expect"))?;
     let role = role_of(&id, input)?;
+    let state = state_of(&id, input)?;
+    let limits = limits_of(&id, input)?;
     match direction {
         "decode" => {
             let bytes_hex = input
@@ -77,7 +92,7 @@ fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
             let bytes = hex_decode(bytes_hex)?;
             let in_flight =
                 declared_in_flight(&id, input)?.unwrap_or_else(|| default_in_flight(&bytes));
-            run_decode(&id, &bytes, role, &in_flight, expect)?;
+            run_decode(&id, &bytes, role, state, limits, &in_flight, expect)?;
         }
         "encode" => run_encode(&id, input, expect)?,
         "both" => {
@@ -89,11 +104,43 @@ fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
             let bytes = hex_decode(bytes_hex)?;
             let in_flight =
                 declared_in_flight(&id, input)?.unwrap_or_else(|| default_in_flight(&bytes));
-            run_decode(&id, &bytes, role, &in_flight, expect)?;
+            run_decode(&id, &bytes, role, state, limits, &in_flight, expect)?;
         }
         other => return Err(format!("fixture {id}: unknown direction {other}").into()),
     }
     Ok(())
+}
+
+/// Returns the connection state a fixture offers its bytes in.
+fn state_of(id: &str, input: &Json) -> Result<ConnectionState, Box<dyn Error>> {
+    match input.get("state").and_then(Json::as_str) {
+        Some("pre-negotiation") => Ok(ConnectionState::PreNegotiation),
+        Some("negotiated") | None => Ok(ConnectionState::Negotiated),
+        Some(other) => Err(format!("fixture {id}: unknown state {other}").into()),
+    }
+}
+
+/// Returns the size bounds in force when a fixture states them.
+fn limits_of(id: &str, input: &Json) -> Result<Limits, Box<dyn Error>> {
+    let Some(json) = input.get("limits") else {
+        return Ok(Limits::PRE_NEGOTIATION);
+    };
+    let frame_size = number(
+        id,
+        "maximum_frame_size",
+        json.get("maximum_frame_size")
+            .ok_or_else(|| format!("fixture {id}: limits missing maximum_frame_size"))?,
+    )?;
+    let metadata_size = number(
+        id,
+        "maximum_metadata_size",
+        json.get("maximum_metadata_size")
+            .ok_or_else(|| format!("fixture {id}: limits missing maximum_metadata_size"))?,
+    )?;
+    Ok(Limits {
+        frame_size: u64::try_from(frame_size)?,
+        metadata_size: u16::try_from(metadata_size)?,
+    })
 }
 
 /// Returns the role a fixture offers its bytes to.
@@ -147,11 +194,55 @@ fn request_id_from(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(array))
 }
 
+/// The typed view of an admitted frame's payload.
+enum PayloadView<'a> {
+    /// The handshake request payload.
+    Request(HandshakeRequest<'a>),
+    /// The handshake response payload.
+    Response(HandshakeResponse<'a>),
+    /// A payload the contract leaves opaque.
+    Opaque,
+}
+
+/// Validates the payload of a frame that carries a handshake exchange.
+///
+/// A request is decoded and, at a responder, checked against the versions
+/// this implementation supports. A success response read before negotiation
+/// is decoded against this implementation's offer.
+fn handshake_view<'a>(
+    frame: &Frame<'a>,
+    role: Role,
+    state: ConnectionState,
+) -> Result<PayloadView<'a>, protocol::Failure> {
+    let header = frame.header();
+    let Payload::Opaque(payload) = frame.payload() else {
+        return Ok(PayloadView::Opaque);
+    };
+    if header.kind() == Kind::Request && header.code() == protocol::HANDSHAKE_OPCODE {
+        let request = HandshakeRequest::decode(payload)?;
+        if role == Role::Server && request.highest_mutual_version(SUPPORTED_VERSIONS).is_none() {
+            return Err(protocol::Failure::unsupported_protocol_version());
+        }
+        return Ok(PayloadView::Request(request));
+    }
+    if header.kind() == Kind::Response
+        && header.code() == 0
+        && state == ConnectionState::PreNegotiation
+    {
+        return Ok(PayloadView::Response(HandshakeResponse::decode(
+            payload, &OFFER,
+        )?));
+    }
+    Ok(PayloadView::Opaque)
+}
+
 /// Checks one decode expectation.
 fn run_decode(
     id: &str,
     bytes: &[u8],
     role: Role,
+    state: ConnectionState,
+    limits: Limits,
     in_flight: &[u64],
     expect: &Json,
 ) -> Result<(), Box<dyn Error>> {
@@ -159,7 +250,15 @@ fn run_decode(
         .get("outcome")
         .and_then(Json::as_str)
         .ok_or_else(|| format!("fixture {id}: missing outcome"))?;
-    let step = protocol::decode(bytes, role, in_flight);
+    let step = protocol::decode(
+        bytes,
+        Admission {
+            role,
+            state,
+            limits,
+            in_flight,
+        },
+    );
     match outcome {
         "success" => match step {
             Step::Frame(frame) => {
@@ -177,36 +276,50 @@ fn run_decode(
                         "fixture {id}: retires"
                     );
                 }
+                let view = handshake_view(&frame, role, state).map_err(|failure| {
+                    format!(
+                        "fixture {id}: expected success, got class {}",
+                        failure.class().name()
+                    )
+                })?;
                 let fields = expect
                     .get("fields")
                     .ok_or_else(|| format!("fixture {id}: missing expect.fields"))?;
-                check_fields(id, &frame, fields)?;
+                check_fields(id, &frame, &view, fields)?;
             }
             other => return Err(format!("fixture {id}: expected frame, got {other:?}").into()),
         },
-        "failure" => match step {
-            Step::Failure { failure, consumed } => {
-                let class = expect
-                    .get("class")
-                    .and_then(Json::as_str)
-                    .ok_or_else(|| format!("fixture {id}: missing class"))?;
-                let scope = expect
-                    .get("scope")
-                    .and_then(Json::as_str)
-                    .ok_or_else(|| format!("fixture {id}: missing scope"))?;
-                assert_eq!(failure.class().name(), class, "fixture {id}: class");
-                assert_eq!(failure.scope().name(), scope, "fixture {id}: scope");
-                if let Some(consumed_expected) = expect.get("bytes_consumed").and_then(Json::as_i64)
-                {
-                    assert_eq!(
-                        consumed,
-                        usize::try_from(consumed_expected)?,
-                        "fixture {id}: bytes_consumed"
-                    );
+        "failure" => {
+            let (failure, consumed) = match step {
+                Step::Failure { failure, consumed } => (failure, consumed),
+                Step::Frame(frame) => match handshake_view(&frame, role, state) {
+                    Err(failure) => (failure, bytes.len()),
+                    Ok(_) => {
+                        return Err(format!("fixture {id}: expected failure, got a frame").into());
+                    }
+                },
+                other @ Step::Need(_) => {
+                    return Err(format!("fixture {id}: expected failure, got {other:?}").into());
                 }
+            };
+            let class = expect
+                .get("class")
+                .and_then(Json::as_str)
+                .ok_or_else(|| format!("fixture {id}: missing class"))?;
+            let scope = expect
+                .get("scope")
+                .and_then(Json::as_str)
+                .ok_or_else(|| format!("fixture {id}: missing scope"))?;
+            assert_eq!(failure.class().name(), class, "fixture {id}: class");
+            assert_eq!(failure.scope().name(), scope, "fixture {id}: scope");
+            if let Some(consumed_expected) = expect.get("bytes_consumed").and_then(Json::as_i64) {
+                assert_eq!(
+                    consumed,
+                    usize::try_from(consumed_expected)?,
+                    "fixture {id}: bytes_consumed"
+                );
             }
-            other => return Err(format!("fixture {id}: expected failure, got {other:?}").into()),
-        },
+        }
         "incomplete" => {
             let required = expect
                 .get("bytes_required")
@@ -229,12 +342,153 @@ fn run_decode(
 }
 
 /// Checks every field the fixture states against the decoded frame.
-fn check_fields(id: &str, frame: &Frame<'_>, fields: &Json) -> Result<(), Box<dyn Error>> {
+fn check_fields(
+    id: &str,
+    frame: &Frame<'_>,
+    view: &PayloadView<'_>,
+    fields: &Json,
+) -> Result<(), Box<dyn Error>> {
     let object = fields
         .as_object()
         .ok_or_else(|| format!("fixture {id}: fields must be an object"))?;
     for (key, expected) in object {
-        check_field(id, frame, key, expected)?;
+        check_field(id, frame, view, key, expected)?;
+    }
+    Ok(())
+}
+
+/// Returns the capability entries a handshake payload view carries.
+fn capability_entries<'v, 'a>(view: &'v PayloadView<'a>) -> Option<&'v [CapabilityEntry<'a>]> {
+    match view {
+        PayloadView::Request(request) => Some(request.capability_entries().entries()),
+        PayloadView::Response(response) => Some(response.accepted_capability_entries().entries()),
+        PayloadView::Opaque => None,
+    }
+}
+
+/// Checks a handshake payload field, reporting whether `key` named one.
+fn check_handshake_field(
+    id: &str,
+    view: &PayloadView<'_>,
+    key: &str,
+    expected: &Json,
+) -> Result<bool, Box<dyn Error>> {
+    match key {
+        "client_maximum_protocol_version" => {
+            let PayloadView::Request(request) = view else {
+                return Err(format!("fixture {id}: {key} needs a handshake request").into());
+            };
+            assert_eq!(
+                i64::from(request.client_maximum_protocol_version()),
+                number(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "client_minimum_protocol_version" => {
+            let PayloadView::Request(request) = view else {
+                return Err(format!("fixture {id}: {key} needs a handshake request").into());
+            };
+            assert_eq!(
+                i64::from(request.client_minimum_protocol_version()),
+                number(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "client_desired_maximum_frame_size" => {
+            let PayloadView::Request(request) = view else {
+                return Err(format!("fixture {id}: {key} needs a handshake request").into());
+            };
+            assert_eq!(
+                i64::from(request.client_desired_maximum_frame_size()),
+                number(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "capability_count" => {
+            let PayloadView::Request(request) = view else {
+                return Err(format!("fixture {id}: {key} needs a handshake request").into());
+            };
+            assert_eq!(
+                i64::from(request.capability_count()),
+                number(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "negotiated_protocol_version" => {
+            let PayloadView::Response(response) = view else {
+                return Err(format!("fixture {id}: {key} needs a handshake response").into());
+            };
+            assert_eq!(
+                i64::from(response.negotiated_protocol_version()),
+                number(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "negotiated_maximum_frame_size" => {
+            let PayloadView::Response(response) = view else {
+                return Err(format!("fixture {id}: {key} needs a handshake response").into());
+            };
+            assert_eq!(
+                i64::from(response.negotiated_maximum_frame_size()),
+                number(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "negotiated_maximum_metadata_size" => {
+            let PayloadView::Response(response) = view else {
+                return Err(format!("fixture {id}: {key} needs a handshake response").into());
+            };
+            assert_eq!(
+                i64::from(response.negotiated_maximum_metadata_size()),
+                number(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "accepted_capability_count" => {
+            let PayloadView::Response(response) = view else {
+                return Err(format!("fixture {id}: {key} needs a handshake response").into());
+            };
+            assert_eq!(
+                i64::from(response.accepted_capability_count()),
+                number(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "capability_entries" => check_capability_entries(id, view, expected)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// Checks a handshake payload's capability entries against the fixture.
+fn check_capability_entries(
+    id: &str,
+    view: &PayloadView<'_>,
+    expected: &Json,
+) -> Result<(), Box<dyn Error>> {
+    let array = expected
+        .as_array()
+        .ok_or_else(|| format!("fixture {id}: capability_entries must be an array"))?;
+    let entries = capability_entries(view)
+        .ok_or_else(|| format!("fixture {id}: capability_entries needs a handshake payload"))?;
+    assert_eq!(entries.len(), array.len(), "fixture {id}: entry count");
+    for (entry, expected_entry) in entries.iter().zip(array.iter()) {
+        let capability_id = expected_entry
+            .get("capability_id")
+            .ok_or_else(|| format!("fixture {id}: entry missing capability_id"))?;
+        assert_eq!(
+            i64::from(entry.identifier()),
+            number(id, "capability_id", capability_id)?,
+            "fixture {id}: capability_id"
+        );
+        let value = expected_entry
+            .get("value")
+            .ok_or_else(|| format!("fixture {id}: entry missing value"))?;
+        assert_eq!(
+            hex_encode(entry.value()).as_str(),
+            string(id, "capability value", value)?,
+            "fixture {id}: capability value"
+        );
     }
     Ok(())
 }
@@ -243,9 +497,13 @@ fn check_fields(id: &str, frame: &Frame<'_>, fields: &Json) -> Result<(), Box<dy
 fn check_field(
     id: &str,
     frame: &Frame<'_>,
+    view: &PayloadView<'_>,
     key: &str,
     expected: &Json,
 ) -> Result<(), Box<dyn Error>> {
+    if check_handshake_field(id, view, key, expected)? {
+        return Ok(());
+    }
     let header = frame.header();
     match key {
         "version" => assert_eq!(

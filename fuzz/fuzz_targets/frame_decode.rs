@@ -6,9 +6,18 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rp1db::protocol::{self, Role};
+use rp1db::protocol::{self, Admission, ConnectionState, Limits, Role};
+
+fn admission(role: Role, in_flight: &[u64]) -> Admission<'_> {
+    Admission {
+        role,
+        state: ConnectionState::Negotiated,
+        limits: Limits::PRE_NEGOTIATION,
+        in_flight,
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
-    let _ = protocol::decode(data, Role::Client, &[1, 2, 3]);
-    let _ = protocol::decode(data, Role::Server, &[]);
+    let _ = protocol::decode(data, admission(Role::Client, &[1, 2, 3]));
+    let _ = protocol::decode(data, admission(Role::Server, &[]));
 });
