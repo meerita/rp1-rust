@@ -125,7 +125,7 @@ async fn connect_completes_against_a_fragmenting_peer() -> Result<(), Box<dyn Er
     });
 
     let config = ConnectionConfig::new(address.to_string());
-    let mut connection = Connection::connect(&config).await?;
+    let connection = Connection::connect(&config).await?;
     assert_eq!(connection.protocol_version(), 0);
     assert_eq!(connection.maximum_frame_size(), 65_536);
     assert_eq!(connection.maximum_metadata_size(), 4_096);
@@ -318,7 +318,7 @@ async fn client_sends_the_handshake_first_and_only_once() -> Result<(), Box<dyn 
     });
 
     let config = ConnectionConfig::new(address.to_string());
-    let mut connection = Connection::connect(&config).await?;
+    let connection = Connection::connect(&config).await?;
     assert_eq!(connection.state(), ConnectionState::Usable);
     connection.close().await?;
     peer.await??;
@@ -371,7 +371,7 @@ async fn usable_connection_closes_explicitly() -> Result<(), Box<dyn Error>> {
     });
 
     let config = ConnectionConfig::new(address.to_string());
-    let mut connection = Connection::connect(&config).await?;
+    let connection = Connection::connect(&config).await?;
     assert_eq!(connection.state(), ConnectionState::Usable);
     assert!(connection.is_usable());
     connection.close().await?;
@@ -465,7 +465,7 @@ async fn usable_connection_reports_local_and_effective_limits() -> Result<(), Bo
         .desired_maximum_frame_size(131_072)
         .local_maximum_frame_size(131_072)
         .local_maximum_metadata_size(8_192);
-    let mut connection = Connection::connect(&config).await?;
+    let connection = Connection::connect(&config).await?;
     assert_eq!(connection.maximum_frame_size(), 131_072);
     assert_eq!(connection.maximum_metadata_size(), 8_192);
     assert_eq!(connection.local_maximum_frame_size(), 131_072);
