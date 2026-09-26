@@ -1,0 +1,29 @@
+{
+  "id": "correlation/withdrawal-naming-an-id-not-in-flight",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Withdrawal",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0007000000000000000000000300000000000000",
+    "role": "server",
+    "in_flight": [],
+    "capabilities": [
+      2
+    ]
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 7,
+      "flags": 0,
+      "code": 0,
+      "metadata_length": 0,
+      "payload_length": 0,
+      "request_id": "3"
+    },
+    "bytes_consumed": 20
+  }
+}

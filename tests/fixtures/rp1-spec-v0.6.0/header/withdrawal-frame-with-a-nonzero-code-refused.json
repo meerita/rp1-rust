@@ -1,0 +1,20 @@
+{
+  "id": "header/withdrawal-frame-with-a-nonzero-code-refused",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "The Control Code on a Kind That Assigns None",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0007000001000000000000000100000000000000",
+    "role": "server",
+    "capabilities": [
+      2
+    ]
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

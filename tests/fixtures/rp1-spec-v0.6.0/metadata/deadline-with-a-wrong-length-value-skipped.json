@@ -1,0 +1,34 @@
+{
+  "id": "metadata/deadline-with-a-wrong-length-value-skipped",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "The Assigned Identifiers",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0001000002000600000000000100000000000000010002000a0b",
+    "role": "server",
+    "capabilities": [
+      4
+    ]
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "metadata_length": 6,
+      "payload_length": 0,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 1,
+          "value": "0a0b"
+        }
+      ]
+    },
+    "bytes_consumed": 26
+  }
+}

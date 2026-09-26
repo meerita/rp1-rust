@@ -58,18 +58,29 @@ const READ_CHUNK: usize = 4_096;
 /// Spawns the driver task for an established session.
 ///
 /// The live registry is empty after the handshake. The limits are the
-/// effective bounds in force. The state and admission are shared with the
+/// effective bounds in force, and the capabilities are the accepted set of
+/// the negotiated session. The state and admission are shared with the
 /// connection handles. Returns the submit channel and the driver handle.
 pub(super) fn spawn(
     transport: AnyTransport,
     limits: Limits,
+    capabilities: Vec<u16>,
     state: Arc<Mutex<ConnectionState>>,
     admission: Arc<tokio::sync::Semaphore>,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> (mpsc::Sender<Submit>, tokio::task::JoinHandle<DriverExit>) {
     let (submit_tx, submit_rx) = mpsc::channel(64);
     let handle = tokio::spawn(async move {
-        run_driver(transport, submit_rx, shutdown_rx, limits, state, admission).await
+        run_driver(
+            transport,
+            submit_rx,
+            shutdown_rx,
+            limits,
+            capabilities,
+            state,
+            admission,
+        )
+        .await
     });
     (submit_tx, handle)
 }
@@ -156,6 +167,7 @@ fn drain_frames(
     completions: &mut HashMap<u64, oneshot::Sender<Result<Vec<u8>, DriverError>>>,
     live: &mut InFlightRegistry,
     limits: Limits,
+    capabilities: &[u16],
 ) -> Option<Failure> {
     loop {
         let live_ids = live.live_ids();
@@ -164,6 +176,7 @@ fn drain_frames(
             state: ProtocolState::Negotiated,
             limits,
             in_flight: &live_ids,
+            capabilities,
         };
         match crate::protocol::decode(buffer, admission) {
             Step::Need(_) => return None,
@@ -214,6 +227,7 @@ async fn run_driver(
     mut submit_rx: mpsc::Receiver<Submit>,
     mut shutdown_rx: oneshot::Receiver<()>,
     limits: Limits,
+    capabilities: Vec<u16>,
     state: Arc<Mutex<ConnectionState>>,
     admission: Arc<tokio::sync::Semaphore>,
 ) -> DriverExit {
@@ -276,7 +290,13 @@ async fn run_driver(
                     }
                     Ok(Some(chunk)) => {
                         buffer.extend_from_slice(&chunk);
-                        if let Some(failure) = drain_frames(&mut buffer, &mut completions, &mut live, limits) {
+                        if let Some(failure) = drain_frames(
+                            &mut buffer,
+                            &mut completions,
+                            &mut live,
+                            limits,
+                            &capabilities,
+                        ) {
                             fail_all(
                                 &mut completions,
                                 &mut live,

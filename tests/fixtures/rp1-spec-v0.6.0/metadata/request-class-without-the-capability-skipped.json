@@ -1,0 +1,31 @@
+{
+  "id": "metadata/request-class-without-the-capability-skipped",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Request Classes",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00010000020005000000000001000000000000000200010001",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "metadata_length": 5,
+      "payload_length": 0,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 2,
+          "value": "01"
+        }
+      ]
+    },
+    "bytes_consumed": 25
+  }
+}

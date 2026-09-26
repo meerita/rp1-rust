@@ -483,3 +483,128 @@ async fn an_empty_endpoint_fails_before_connecting() -> Result<(), Box<dyn Error
     assert!(Connection::connect(&config).await.is_err());
     Ok(())
 }
+
+// Scenario B.hello.offer-lifetime-capabilities: the client offers the
+// cancellation and deadlines capabilities in ascending order with empty
+// values. Caller outcome: a usable connection. State outcome: the peer
+// observes entries for 0x0002 and 0x0004.
+#[tokio::test]
+async fn client_offers_cancellation_and_deadlines() -> Result<(), Box<dyn Error>> {
+    use rp1db::protocol::HandshakeRequest;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let response = response_frame(0, 65_536, 4_096);
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        let (version, kind, code, payload) = read_frame(&mut socket).await?;
+        assert_eq!(version, 0, "version");
+        assert_eq!(kind, 1, "REQUEST");
+        assert_eq!(code, 0x0001, "handshake opcode");
+        let request = HandshakeRequest::decode(&payload).map_err(|failure| {
+            std::io::Error::new(ErrorKind::InvalidData, failure.class().name())
+        })?;
+        let offered: Vec<u16> = request
+            .capability_entries()
+            .entries()
+            .iter()
+            .map(|entry| entry.identifier())
+            .collect();
+        assert_eq!(offered, vec![0x0002, 0x0004], "offered capabilities");
+        for entry in request.capability_entries().entries() {
+            assert!(
+                entry.value().is_empty(),
+                "capability entries carry no value"
+            );
+        }
+        socket.write_all(&response).await?;
+        socket.flush().await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let config = ConnectionConfig::new(address.to_string());
+    let connection = Connection::connect(&config).await?;
+    assert_eq!(connection.state(), ConnectionState::Usable);
+    connection.close().await?;
+    peer.await??;
+    Ok(())
+}
+
+// Scenario B.hello.accepted-capabilities-stored: the peer accepts both
+// offered capabilities. Caller outcome: a usable connection exposing the
+// accepted set. State outcome: usable.
+#[tokio::test]
+async fn accepted_capabilities_are_stored() -> Result<(), Box<dyn Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let response = response_frame_with_entries(0, 65_536, 4_096, &[(0x0002, &[]), (0x0004, &[])]);
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        let mut buffer = [0u8; 1024];
+        let _ = socket.read(&mut buffer).await?;
+        socket.write_all(&response).await?;
+        socket.flush().await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let config = ConnectionConfig::new(address.to_string());
+    let connection = Connection::connect(&config).await?;
+    assert_eq!(connection.accepted_capabilities(), &[0x0002, 0x0004]);
+    assert_eq!(connection.state(), ConnectionState::Usable);
+    connection.close().await?;
+    peer.await??;
+    Ok(())
+}
+
+// Scenario B.hello.partial-capability-acceptance: the peer accepts only
+// deadlines. Caller outcome: a usable connection exposing exactly that
+// capability. State outcome: usable.
+#[tokio::test]
+async fn a_partially_accepted_set_is_stored() -> Result<(), Box<dyn Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let response = response_frame_with_entries(0, 65_536, 4_096, &[(0x0004, &[])]);
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        let mut buffer = [0u8; 1024];
+        let _ = socket.read(&mut buffer).await?;
+        socket.write_all(&response).await?;
+        socket.flush().await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let config = ConnectionConfig::new(address.to_string());
+    let connection = Connection::connect(&config).await?;
+    assert_eq!(connection.accepted_capabilities(), &[0x0004]);
+    connection.close().await?;
+    peer.await??;
+    Ok(())
+}
+
+// Scenario B.hello.valued-capability-ignored: the peer accepts an offered
+// capability with a non-zero value length. Caller outcome: a usable
+// connection that treats the capability as not accepted. State outcome:
+// usable, with an empty accepted set.
+#[tokio::test]
+async fn an_accepted_capability_with_a_value_is_ignored() -> Result<(), Box<dyn Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let response = response_frame_with_entries(0, 65_536, 4_096, &[(0x0002, &[0xaa])]);
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        let mut buffer = [0u8; 1024];
+        let _ = socket.read(&mut buffer).await?;
+        socket.write_all(&response).await?;
+        socket.flush().await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let config = ConnectionConfig::new(address.to_string());
+    let connection = Connection::connect(&config).await?;
+    assert!(
+        connection.accepted_capabilities().is_empty(),
+        "a valued entry is not accepted"
+    );
+    connection.close().await?;
+    peer.await??;
+    Ok(())
+}

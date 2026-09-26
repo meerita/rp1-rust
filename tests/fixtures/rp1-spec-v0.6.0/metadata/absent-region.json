@@ -1,0 +1,26 @@
+{
+  "id": "metadata/absent-region",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "The Metadata Region",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000000000000000000000900000000000000",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 2,
+      "flags": 0,
+      "code": 0,
+      "metadata_length": 0,
+      "payload_length": 0,
+      "request_id": "9",
+      "metadata": []
+    },
+    "bytes_consumed": 20
+  }
+}

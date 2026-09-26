@@ -555,6 +555,7 @@ fn drain_frames(
             state: ConnectionState::Negotiated,
             limits: Limits::PRE_NEGOTIATION,
             in_flight: &live_ids,
+            capabilities: &[],
         };
         match crate::protocol::decode(buffer, admission) {
             Step::Need(_) => return ReadOutcome::NeedMore,

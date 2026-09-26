@@ -1,0 +1,34 @@
+{
+  "id": "metadata/request-class-value-not-assigned-skipped",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "The Request Class Entry",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00010000020005000000000001000000000000000200010004",
+    "role": "server",
+    "capabilities": [
+      5
+    ]
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "metadata_length": 5,
+      "payload_length": 0,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 2,
+          "value": "04"
+        }
+      ]
+    },
+    "bytes_consumed": 25
+  }
+}

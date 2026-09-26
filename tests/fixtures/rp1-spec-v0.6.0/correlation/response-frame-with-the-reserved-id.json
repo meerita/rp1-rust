@@ -1,0 +1,17 @@
+{
+  "id": "correlation/response-frame-with-the-reserved-id",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "The Reserved Request Id",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000000000000000000000000000000000000",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

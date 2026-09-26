@@ -1,0 +1,34 @@
+{
+  "id": "errors/deadline-exceeded-is-request-scoped",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Deadline exceeded",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00030000060000000200000001000000000000000000",
+    "role": "client",
+    "in_flight": [
+      "1"
+    ],
+    "capabilities": [
+      4
+    ]
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 3,
+      "flags": 0,
+      "code": 6,
+      "metadata_length": 0,
+      "payload_length": 2,
+      "request_id": "1",
+      "detail_length": 0,
+      "detail_bytes": "",
+      "text": ""
+    },
+    "bytes_consumed": 22
+  }
+}

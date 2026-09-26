@@ -1,0 +1,48 @@
+{
+  "id": "metadata/deadline-entry-encoding",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "The Assigned Identifiers",
+  "direction": "both",
+  "provenance": "derived-from-specification",
+  "input": {
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 1,
+          "value": "10270000"
+        }
+      ],
+      "payload": ""
+    },
+    "role": "server",
+    "capabilities": [
+      4
+    ]
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "metadata_length": 8,
+      "payload_length": 0,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 1,
+          "value": "10270000"
+        }
+      ]
+    },
+    "bytes": "00010000020008000000000001000000000000000100040010270000",
+    "bytes_consumed": 28
+  }
+}

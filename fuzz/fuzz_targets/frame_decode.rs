@@ -14,6 +14,7 @@ fn admission(role: Role, in_flight: &[u64]) -> Admission<'_> {
         state: ConnectionState::Negotiated,
         limits: Limits::PRE_NEGOTIATION,
         in_flight,
+        capabilities: &[],
     }
 }
 

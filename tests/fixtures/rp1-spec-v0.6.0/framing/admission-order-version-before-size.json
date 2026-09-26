@@ -1,0 +1,17 @@
+{
+  "id": "framing/admission-order-version-before-size",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Frame Admission Order",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "010100000000000040420f000100000000000000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "unsupported protocol version",
+    "scope": "connection-fatal"
+  }
+}

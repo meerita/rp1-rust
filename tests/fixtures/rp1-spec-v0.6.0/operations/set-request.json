@@ -1,0 +1,28 @@
+{
+  "id": "operations/set-request",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "SET",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00010000040000000a0000000100000000000000030000006b657976616c",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 4,
+      "metadata_length": 0,
+      "payload_length": 10,
+      "request_id": "1",
+      "key_length": 3,
+      "key": "6b6579",
+      "value": "76616c"
+    },
+    "bytes_consumed": 30
+  }
+}

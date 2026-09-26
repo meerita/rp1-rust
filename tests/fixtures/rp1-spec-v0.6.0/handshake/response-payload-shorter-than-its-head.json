@@ -1,0 +1,18 @@
+{
+  "id": "handshake/response-payload-shorter-than-its-head",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Validating a handshake payload",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000000000000090000000100000000000000000000000100001000",
+    "role": "client",
+    "state": "pre-negotiation"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "malformed request",
+    "scope": "connection-fatal"
+  }
+}

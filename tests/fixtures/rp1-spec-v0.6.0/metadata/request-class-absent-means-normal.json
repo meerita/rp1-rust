@@ -1,0 +1,37 @@
+{
+  "id": "metadata/request-class-absent-means-normal",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "The Request Class Entry",
+  "direction": "both",
+  "provenance": "derived-from-specification",
+  "input": {
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "request_id": "1",
+      "metadata": [],
+      "payload": ""
+    },
+    "role": "server",
+    "capabilities": [
+      5
+    ]
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "metadata_length": 0,
+      "payload_length": 0,
+      "request_id": "1"
+    },
+    "bytes": "0001000002000000000000000100000000000000",
+    "bytes_consumed": 20
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "id": "metadata/request-class-entry-encoding",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "The Request Class Entry",
+  "direction": "both",
+  "provenance": "derived-from-specification",
+  "input": {
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 2,
+          "value": "00"
+        }
+      ],
+      "payload": ""
+    },
+    "role": "server",
+    "capabilities": [
+      5
+    ]
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "metadata_length": 5,
+      "payload_length": 0,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 2,
+          "value": "00"
+        }
+      ]
+    },
+    "bytes": "00010000020005000000000001000000000000000200010000",
+    "bytes_consumed": 25
+  }
+}
