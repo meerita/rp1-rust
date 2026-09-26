@@ -1,0 +1,17 @@
+{
+  "id": "operations/declared-key-length-overruns-the-payload",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "The key and the value",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "000100000400000007000000010000000000000005000000616263",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "malformed request",
+    "scope": "connection-fatal"
+  }
+}

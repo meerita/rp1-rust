@@ -1,4 +1,4 @@
-//! Runs the vendored `rp1-spec` `v0.4.0` fixture corpus against the protocol
+//! Runs the vendored `rp1-spec` `v0.5.0` fixture corpus against the protocol
 //! codec.
 //!
 //! The corpus is test data. This harness reads every fixture, offers its
@@ -27,14 +27,14 @@ const OFFER: HandshakeOffer<'_> = HandshakeOffer {
 /// Runs every fixture in the vendored corpus.
 #[test]
 fn corpus_conformance() -> Result<(), Box<dyn Error>> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rp1-spec-v0.4.0");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rp1-spec-v0.5.0");
     let mut files = Vec::new();
     collect_json_files(&root, &mut files)?;
     files.sort();
     assert_eq!(
         files.len(),
-        89,
-        "expected 89 fixtures, found {}",
+        107,
+        "expected 107 fixtures, found {}",
         files.len()
     );
     for file in &files {
@@ -69,7 +69,7 @@ fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
         .get("revision")
         .and_then(Json::as_str)
         .ok_or_else(|| format!("fixture {id}: missing revision"))?;
-    assert_eq!(revision, "v0.4.0", "fixture {id}: wrong revision");
+    assert_eq!(revision, "v0.5.0", "fixture {id}: wrong revision");
     let direction = value
         .get("direction")
         .and_then(Json::as_str)
@@ -493,6 +493,94 @@ fn check_capability_entries(
     Ok(())
 }
 
+/// Reads the `u32` key length at the head of a `SET` request payload.
+fn set_key_length(id: &str, payload: &[u8]) -> Result<u32, Box<dyn Error>> {
+    let head: [u8; 4] = payload
+        .get(..4)
+        .ok_or_else(|| format!("fixture {id}: SET payload shorter than its head"))?
+        .try_into()
+        .map_err(|_| format!("fixture {id}: SET head decode"))?;
+    Ok(u32::from_le_bytes(head))
+}
+
+/// Returns the key bytes of an operation payload.
+fn operation_key<'a>(id: &str, code: u16, payload: &'a [u8]) -> Result<&'a [u8], Box<dyn Error>> {
+    if code == 0x0004 {
+        let key_length = set_key_length(id, payload)?;
+        let key_end = 4usize
+            .checked_add(usize::try_from(key_length)?)
+            .ok_or_else(|| format!("fixture {id}: key length overflow"))?;
+        payload
+            .get(4..key_end)
+            .ok_or_else(|| format!("fixture {id}: key overruns the payload").into())
+    } else {
+        Ok(payload)
+    }
+}
+
+/// Returns the value bytes of an operation payload.
+fn operation_value<'a>(id: &str, code: u16, payload: &'a [u8]) -> Result<&'a [u8], Box<dyn Error>> {
+    if code == 0x0004 {
+        let key_length = set_key_length(id, payload)?;
+        let value_start = 4usize
+            .checked_add(usize::try_from(key_length)?)
+            .ok_or_else(|| format!("fixture {id}: key length overflow"))?;
+        payload
+            .get(value_start..)
+            .ok_or_else(|| format!("fixture {id}: value overruns the payload").into())
+    } else {
+        Ok(payload)
+    }
+}
+
+/// Checks an operation payload field, reporting whether `key` named one.
+fn check_operation_field(
+    id: &str,
+    frame: &Frame<'_>,
+    key: &str,
+    expected: &Json,
+) -> Result<bool, Box<dyn Error>> {
+    let header = frame.header();
+    match key {
+        "key" => {
+            let Payload::Opaque(payload) = frame.payload() else {
+                return Err(format!("fixture {id}: expected an opaque payload for key").into());
+            };
+            let key_bytes = operation_key(id, header.code(), payload)?;
+            assert_eq!(
+                hex_encode(key_bytes).as_str(),
+                string(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "value" => {
+            let Payload::Opaque(payload) = frame.payload() else {
+                return Err(format!("fixture {id}: expected an opaque payload for value").into());
+            };
+            let value_bytes = operation_value(id, header.code(), payload)?;
+            assert_eq!(
+                hex_encode(value_bytes).as_str(),
+                string(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        "key_length" => {
+            let Payload::Opaque(payload) = frame.payload() else {
+                return Err(
+                    format!("fixture {id}: expected an opaque payload for key_length").into(),
+                );
+            };
+            assert_eq!(
+                i64::from(set_key_length(id, payload)?),
+                number(id, key, expected)?,
+                "fixture {id}: {key}"
+            );
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// Checks one named field against the decoded frame.
 fn check_field(
     id: &str,
@@ -502,6 +590,9 @@ fn check_field(
     expected: &Json,
 ) -> Result<(), Box<dyn Error>> {
     if check_handshake_field(id, view, key, expected)? {
+        return Ok(());
+    }
+    if check_operation_field(id, frame, key, expected)? {
         return Ok(());
     }
     let header = frame.header();

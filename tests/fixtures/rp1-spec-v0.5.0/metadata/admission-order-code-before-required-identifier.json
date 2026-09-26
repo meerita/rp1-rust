@@ -1,0 +1,18 @@
+{
+  "id": "metadata/admission-order-code-before-required-identifier",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "Frame Admission Order",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "000100000700040000000000010000000000000000800000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "unsupported operation",
+    "scope": "request-scoped",
+    "bytes_consumed": 24
+  }
+}

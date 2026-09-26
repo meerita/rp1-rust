@@ -1,0 +1,25 @@
+{
+  "id": "operations/ping-request",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "The Liveness Operation",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0001000002000000000000000100000000000000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "metadata_length": 0,
+      "payload_length": 0,
+      "request_id": "1"
+    },
+    "bytes_consumed": 20
+  }
+}

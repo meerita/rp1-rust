@@ -1,0 +1,17 @@
+{
+  "id": "errors/error-class-zero-refused",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "The Error Class Registry",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00030000000000000200000001000000000000000000",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

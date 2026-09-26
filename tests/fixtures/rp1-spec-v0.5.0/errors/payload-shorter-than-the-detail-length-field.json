@@ -1,0 +1,17 @@
+{
+  "id": "errors/payload-shorter-than-the-detail-length-field",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "The ERROR Frame Payload",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "000300000300000001000000010000000000000000",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "malformed request",
+    "scope": "connection-fatal"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": "correlation/partial-frame-retires-no-request",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "A Connection That Ends",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000000000000000000000b000000000000",
+    "role": "client",
+    "in_flight": [
+      "11"
+    ]
+  },
+  "expect": {
+    "outcome": "incomplete",
+    "bytes_required": 20,
+    "retires": "0"
+  }
+}

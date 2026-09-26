@@ -1,0 +1,36 @@
+{
+  "id": "handshake/capability-entry-with-a-value-ignored",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "An Unassigned Identifier",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00010000010000001000000001000000000000000000000000000100010007000200aabb",
+    "role": "server",
+    "state": "pre-negotiation"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 1,
+      "metadata_length": 0,
+      "payload_length": 16,
+      "request_id": "1",
+      "client_maximum_protocol_version": 0,
+      "client_minimum_protocol_version": 0,
+      "client_desired_maximum_frame_size": 65536,
+      "capability_count": 1,
+      "capability_entries": [
+        {
+          "capability_id": 7,
+          "value": "aabb"
+        }
+      ]
+    },
+    "bytes_consumed": 36
+  }
+}

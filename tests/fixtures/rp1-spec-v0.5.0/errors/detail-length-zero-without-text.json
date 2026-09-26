@@ -1,0 +1,28 @@
+{
+  "id": "errors/detail-length-zero-without-text",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "The ERROR Frame Payload",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00030000030000000200000001000000000000000000",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 3,
+      "flags": 0,
+      "code": 3,
+      "metadata_length": 0,
+      "payload_length": 2,
+      "request_id": "1",
+      "detail_length": 0,
+      "detail_bytes": "",
+      "text": ""
+    },
+    "bytes_consumed": 22
+  }
+}
