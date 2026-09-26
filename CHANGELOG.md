@@ -9,6 +9,44 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The five core commands as typed binary-safe async methods on the
+  shared connection: `ping`, `get`, `set`, `del`, and `exists`. Inputs
+  take `impl AsRef<[u8]>` so every byte string passes through untouched
+  and outputs are owned. `GET` answers a three-state `GetOutcome`
+  (present with the value bytes, absent, or held outside memory with the
+  logical length); a present empty value and a missing key are different
+  variants. `DEL` and `EXISTS` answer presence as a boolean; `SET` and
+  `PING` answer unit on success. Concurrent calls through clones
+  multiplex over one session with no exclusive borrow.
+- Structured command errors that keep server refusal, server failure,
+  transport failure, protocol failure, local refusal, and ambiguous
+  completion distinguishable. Unsupported operation, invalid argument,
+  overloaded, and wrong type retire exactly one request and keep the
+  session usable; internal error preserves ambiguity instead of
+  resolving it and is never retried automatically. Oversized requests
+  refuse locally with the effective bound before any byte is sent.
+  Servers at earlier revisions answer each command with unsupported
+  operation per request while the session keeps serving.
+- A production multiplexed driver for established sessions: serial
+  writes, incremental reads, dispatch of terminal frames by request ID
+  in any arrival order, per-request resolution of request-scoped
+  failures, and session-wide resolution with sticky terminal states on
+  fatal frames, transport loss, peer close, or explicit shutdown.
+- Command conformance: per-command success and miss paths, a binary
+  safety matrix (empty, NUL, invalid UTF-8, all byte values, boundary
+  sizes), local-refusal behavior with a follow-up command proving
+  nothing was sent, concurrent mixed commands through clones, refusal
+  and ambiguity suites with per-request isolation, TCP permutation runs
+  through `PING` and `GET` in every scripted order including bytewise
+  fragmented responses, and black-box happy and miss paths against an
+  identified server build. Stable `B.multiplex.*` scenarios run through
+  public commands and the `C.*` core profile maps to the command,
+  refusal, and interop suites.
+- Layer C passes subject to one recorded exclusion: a success response
+  carrying a payload the operation does not define (non-empty `PING`,
+  `SET`, `DEL`, or `EXISTS` success) has no receiver rule at this
+  revision. No scenario runs for it and the client accepts it without
+  refusal pending clarification from the public specification.
 - Multiplexed request lifecycle on one connection: monotonic initiator
   identifiers from 1 with 0 skipped on wrap, a live registry that
   refuses 0 and live reuse and retires each identifier once, and
@@ -81,17 +119,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Package metadata, an asserted package file list, and the
   MIT OR Apache-2.0 offer.
 - Public documentation and governance files.
-- A low-level `protocol` module implementing the `rp1-spec` `v0.4.0`
-  framing, codec, handshake, and negotiation contract: validated wire
-  types, an incremental decoder that reads under a connection state and the
-  bounds in force, an encoder, and the frame admission order.
+- A low-level `protocol` module implementing the `rp1-spec` `v0.5.0`
+  framing, codec, handshake, negotiation, and operation contract:
+  validated wire types, an incremental decoder that reads under a
+  connection state and the bounds in force, an encoder, the frame
+  admission order, and the six assigned opcodes.
 - The handshake request and response payload types, the capability
   entry and identifier domain, the negotiated frame and metadata bounds,
   and encode and decode for both payloads as untrusted input.
-- The published `v0.4.0` fixture corpus under `tests/fixtures/`, with an
-  integration test that runs all 89 fixtures in their declared directions.
+- The published `v0.5.0` fixture corpus under `tests/fixtures/`, with an
+  integration test that runs all 107 fixtures in their declared directions.
 - Property, malformed-input, and bounded fuzz coverage for the decoder.
 - `make fuzz` runs the frame decoder fuzz target.
 
-The crate exposes a low-level `protocol` module and a `Connection` surface
-that completes the negotiation handshake. It exposes no command surface.
+The crate exposes a low-level `protocol` module, a `Connection` surface
+that completes the negotiation handshake, and the five core commands
+with structured outcomes and errors.

@@ -1,0 +1,26 @@
+{
+  "id": "operations/exists-request",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "EXISTS",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00010000060000000300000001000000000000006b6579",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 6,
+      "metadata_length": 0,
+      "payload_length": 3,
+      "request_id": "1",
+      "key": "6b6579"
+    },
+    "bytes_consumed": 23
+  }
+}

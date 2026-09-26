@@ -1,0 +1,18 @@
+{
+  "id": "handshake/version-range-maximum-below-minimum",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "The handshake request payload",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00010000010000000a000000010000000000000000000100000001000000",
+    "role": "server",
+    "state": "pre-negotiation"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "malformed request",
+    "scope": "connection-fatal"
+  }
+}

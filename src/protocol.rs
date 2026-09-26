@@ -1,6 +1,6 @@
 //! Low-level RP-1 protocol wire types and codec.
 //!
-//! This module owns the `rp1-spec` `v0.4.0` framing and codec contract: the
+//! This module owns the `rp1-spec` `v0.5.0` framing and codec contract: the
 //! validated header and metadata types, the handshake payload types, the
 //! failure classification, the incremental decoder, and the encoder.
 //!
@@ -9,7 +9,7 @@
 //! validated values.
 
 /// The public specification revision this module implements.
-pub const SPEC_REVISION: &str = "v0.4.0";
+pub const SPEC_REVISION: &str = "v0.5.0";
 
 /// The fixed length of the frame header in bytes.
 pub const HEADER_LENGTH: usize = 20;
@@ -22,6 +22,21 @@ pub const MAX_METADATA_SIZE: u16 = 4_096;
 
 /// The opcode protocol version 0 assigns to the handshake.
 pub const HANDSHAKE_OPCODE: u16 = 0x0001;
+
+/// The opcode protocol version 0 assigns to the liveness operation.
+pub const PING_OPCODE: u16 = 0x0002;
+
+/// The opcode protocol version 0 assigns to the value read.
+pub const GET_OPCODE: u16 = 0x0003;
+
+/// The opcode protocol version 0 assigns to the byte write.
+pub const SET_OPCODE: u16 = 0x0004;
+
+/// The opcode protocol version 0 assigns to the key delete.
+pub const DEL_OPCODE: u16 = 0x0005;
+
+/// The opcode protocol version 0 assigns to the presence read.
+pub const EXISTS_OPCODE: u16 = 0x0006;
 
 /// The lowest value a responder may state as the negotiated maximum frame
 /// size.
@@ -208,7 +223,9 @@ impl RequestId {
 
 /// The opcode field of a request frame.
 ///
-/// The whole domain is unassigned at this revision.
+/// The six values this revision assigns are the handshake and the five
+/// ungated operations. Every other value is unassigned and answered with
+/// the unsupported operation class for that request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Opcode(u16);
 
@@ -217,6 +234,15 @@ impl Opcode {
     #[must_use]
     pub const fn value(self) -> u16 {
         self.0
+    }
+
+    /// Returns whether the opcode is assigned by this revision.
+    #[must_use]
+    pub const fn is_assigned(value: u16) -> bool {
+        matches!(
+            value,
+            HANDSHAKE_OPCODE | PING_OPCODE | GET_OPCODE | SET_OPCODE | DEL_OPCODE | EXISTS_OPCODE
+        )
     }
 }
 
@@ -1211,7 +1237,25 @@ fn admit(input: &[u8], role: Role, limits: Limits) -> Result<Admitted<'_>, Step<
 /// [`EncodeError::FrameTooLarge`] when the total length exceeds the maximum
 /// frame size or a payload field cannot be represented.
 pub fn encode(outgoing: &Outgoing<'_>) -> Result<Vec<u8>, EncodeError> {
-    let metadata_length = checked_metadata_length(outgoing.metadata)?;
+    encode_with_max(outgoing, MAX_FRAME_SIZE, MAX_METADATA_SIZE)
+}
+
+/// Encodes a frame under explicit size bounds and returns its exact bytes.
+///
+/// The bounds are the effective limits in force on the connection that
+/// sends the frame, typically the stricter of the negotiated and local
+/// caps. The pre-negotiation constants apply before the handshake.
+///
+/// # Errors
+///
+/// Returns the same variants as [`encode`], evaluated against the given
+/// bounds instead of the pre-negotiation constants.
+pub fn encode_with_max(
+    outgoing: &Outgoing<'_>,
+    max_frame_size: u64,
+    max_metadata_size: u16,
+) -> Result<Vec<u8>, EncodeError> {
+    let metadata_length = checked_metadata_length_with_max(outgoing.metadata, max_metadata_size)?;
     let payload = encode_payload(outgoing.payload)?;
     let payload_length = u32::try_from(payload.len()).map_err(|_| EncodeError::FrameTooLarge)?;
     let frame_total = u64::try_from(HEADER_LENGTH)
@@ -1219,7 +1263,7 @@ pub fn encode(outgoing: &Outgoing<'_>) -> Result<Vec<u8>, EncodeError> {
         .and_then(|header| header.checked_add(metadata_length))
         .and_then(|total| total.checked_add(u64::from(payload_length)))
         .ok_or(EncodeError::FrameTooLarge)?;
-    if frame_total > MAX_FRAME_SIZE {
+    if frame_total > max_frame_size {
         return Err(EncodeError::FrameTooLarge);
     }
     let metadata_len = u16::try_from(metadata_length).map_err(|_| EncodeError::MetadataTooLarge)?;
@@ -1246,6 +1290,8 @@ pub fn encode(outgoing: &Outgoing<'_>) -> Result<Vec<u8>, EncodeError> {
 enum Correlation {
     /// A request frame carrying the handshake opcode.
     HandshakeRequest,
+    /// A request frame carrying one of the five operation opcodes.
+    OperationRequest(u16),
     /// A response frame carrying an assigned result code.
     Response(ResultCode),
     /// An error frame carrying an assigned class of this scope.
@@ -1345,6 +1391,8 @@ fn correlate(
             }
             if code == HANDSHAKE_OPCODE {
                 Ok(Correlation::HandshakeRequest)
+            } else if Opcode::is_assigned(code) {
+                Ok(Correlation::OperationRequest(code))
             } else {
                 Err(Failure::unsupported_operation())
             }
@@ -1392,6 +1440,39 @@ fn check_metadata_order(metadata: &MetadataRegion<'_>) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Checks the request payload of one of the five ungated operations.
+///
+/// `PING` carries no payload; `GET`, `DEL` and `EXISTS` carry the key
+/// alone with no structural check; `SET` carries a `u32` key length
+/// followed by the key and the derived value. A short `SET` head or a
+/// key length overrunning the payload is a malformed request.
+fn check_operation_request(
+    opcode: u16,
+    payload_length: u32,
+    payload: &[u8],
+) -> Result<Payload<'_>, Failure> {
+    if opcode == PING_OPCODE {
+        if payload_length != 0 {
+            return Err(Failure::malformed_request());
+        }
+        return Ok(Payload::Opaque(&[]));
+    }
+    if opcode == SET_OPCODE {
+        if payload.len() < 4 {
+            return Err(Failure::malformed_request());
+        }
+        let key_length = read_u32_le(payload, 0).ok_or_else(Failure::malformed_request)?;
+        let head = 4usize
+            .checked_add(usize::try_from(key_length).map_err(|_| Failure::malformed_request())?)
+            .ok_or_else(Failure::malformed_request)?;
+        if head > payload.len() {
+            return Err(Failure::malformed_request());
+        }
+        return Ok(Payload::Opaque(payload));
+    }
+    Ok(Payload::Opaque(payload))
+}
+
 /// Checks the payload layout of an admitted frame.
 fn read_payload(
     correlation: Correlation,
@@ -1401,6 +1482,9 @@ fn read_payload(
     match correlation {
         Correlation::HandshakeRequest | Correlation::Response(ResultCode::Success) => {
             Ok(Payload::Opaque(payload))
+        }
+        Correlation::OperationRequest(opcode) => {
+            check_operation_request(opcode, payload_length, payload)
         }
         Correlation::Response(ResultCode::Absent) => {
             if payload_length != 0 {
@@ -1449,8 +1533,11 @@ const fn retires_for(kind: Kind, correlation: Correlation, request_id: u64) -> R
     }
 }
 
-/// Sums the encoded metadata region and enforces its bound.
-fn checked_metadata_length(metadata: &[(u16, &[u8])]) -> Result<u64, EncodeError> {
+/// Sums the encoded metadata region and enforces the given bound.
+fn checked_metadata_length_with_max(
+    metadata: &[(u16, &[u8])],
+    max_metadata_size: u16,
+) -> Result<u64, EncodeError> {
     let mut previous: Option<u16> = None;
     let mut length: u64 = 0;
     for (identifier, value) in metadata {
@@ -1468,7 +1555,7 @@ fn checked_metadata_length(metadata: &[(u16, &[u8])]) -> Result<u64, EncodeError
             .ok_or(EncodeError::MetadataTooLarge)?;
         previous = Some(*identifier);
     }
-    if length > u64::from(MAX_METADATA_SIZE) {
+    if length > u64::from(max_metadata_size) {
         return Err(EncodeError::MetadataTooLarge);
     }
     Ok(length)
@@ -1912,5 +1999,64 @@ mod tests {
         assert_eq!(response.negotiated_maximum_metadata_size(), 4_096);
         assert_eq!(response.encode(), payload, "re-encode is stable");
         Ok(())
+    }
+
+    fn request_bytes(code: u16) -> Vec<u8> {
+        let set_empty: &[u8] = &[0, 0, 0, 0];
+        let payload: &[u8] = if code == SET_OPCODE { set_empty } else { &[] };
+        let outgoing = Outgoing {
+            kind: Kind::Request,
+            code,
+            request_id: 7,
+            metadata: &[],
+            payload: OutgoingPayload::Opaque(payload),
+        };
+        encode(&outgoing).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_five_operation_opcodes_admit() {
+        assert_eq!(SPEC_REVISION, "v0.5.0");
+        for code in [
+            PING_OPCODE,
+            GET_OPCODE,
+            SET_OPCODE,
+            DEL_OPCODE,
+            EXISTS_OPCODE,
+        ] {
+            let bytes = request_bytes(code);
+            match decode_at(&bytes, Role::Server, &[]) {
+                Step::Frame(frame) => {
+                    assert_eq!(frame.header().code(), code);
+                    assert_eq!(frame.retires().value(), 0);
+                }
+                other => assert!(
+                    matches!(other, Step::Need(_)),
+                    "opcode {code:#06x} should admit, got {other:?}"
+                ),
+            }
+        }
+        assert!(Opcode::is_assigned(PING_OPCODE));
+        assert!(Opcode::is_assigned(EXISTS_OPCODE));
+        assert!(!Opcode::is_assigned(0x0000));
+        assert!(!Opcode::is_assigned(0x0007));
+    }
+
+    #[test]
+    fn unassigned_opcodes_refuse_per_request_with_the_session_open() {
+        for code in [0x0000, 0x0007] {
+            let bytes = request_bytes(code);
+            match decode_at(&bytes, Role::Server, &[]) {
+                Step::Failure { failure, consumed } => {
+                    assert_eq!(failure.class(), ErrorClass::UnsupportedOperation);
+                    assert_eq!(failure.scope(), FailureScope::RequestScoped);
+                    assert_eq!(consumed, bytes.len());
+                }
+                other => assert!(
+                    matches!(other, Step::Need(_)),
+                    "opcode {code:#06x} should refuse, got {other:?}"
+                ),
+            }
+        }
     }
 }

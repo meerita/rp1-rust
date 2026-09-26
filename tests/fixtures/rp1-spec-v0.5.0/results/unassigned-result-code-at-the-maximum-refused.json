@@ -1,0 +1,17 @@
+{
+  "id": "results/unassigned-result-code-at-the-maximum-refused",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "Result Codes",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00020000ffff0000000000000100000000000000",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

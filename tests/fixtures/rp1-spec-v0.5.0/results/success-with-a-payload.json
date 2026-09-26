@@ -1,0 +1,25 @@
+{
+  "id": "results/success-with-a-payload",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "Success",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00020000000000000300000001000000000000000a0b0c",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 2,
+      "flags": 0,
+      "code": 0,
+      "metadata_length": 0,
+      "payload_length": 3,
+      "request_id": "1"
+    },
+    "bytes_consumed": 23
+  }
+}

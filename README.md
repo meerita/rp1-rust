@@ -11,13 +11,13 @@ The crate is published as `rp1db`.
 Early development.
 
 The repository builds, tests, lints, and packages the crate. The crate
-implements the public RP-1 protocol specification, revision `v0.4.0`:
+implements the public RP-1 protocol specification, revision `v0.5.0`:
 
 - A low-level `protocol` module with validated wire types, an incremental
   decoder that reads under a connection state and the bounds in force, an
-  encoder, the frame admission order, and the handshake request and
-  response payloads. Its behavior is checked against the published 89
-  fixture corpus.
+  encoder, the frame admission order, the handshake request and
+  response payloads, and the five assigned operation opcodes. Its
+  behavior is checked against the published 107 fixture corpus.
 - A public `ConnectionConfig` and `Connection` with an asynchronous
   `connect` that opens a TCP connection, sends the handshake request as
   the first frame, validates the response, and returns a connection only
@@ -29,7 +29,7 @@ implements the public RP-1 protocol specification, revision `v0.4.0`:
   locally, and a usable connection reports the effective bounds, the
   stricter of the negotiated and local values.
 - Multiplexed request identity on one connection: monotonic initiator
-  identifiers from 1 with 0 skipped, a live registry that retires on the
+  identifiers with 0 skipped, a live registry that retires on the
   terminal frame and releases once, and correlation by ID in any arrival
   order with interleaved completion. One driver owns the transport in
   both directions and dispatches terminal frames into per-request
@@ -43,13 +43,32 @@ implements the public RP-1 protocol specification, revision `v0.4.0`:
   in-flight work from send-state evidence, shuts the transport, and
   lands in closed, failed, or unusable as each path requires. Terminal
   states are sticky.
+- The five core commands as typed binary-safe async methods: `ping`,
+  `get`, `set`, `del`, and `exists`. Keys and values are opaque byte
+  strings; empty keys and empty values are ordinary values, and a
+  present empty value never conflates with a missing key. `GET` answers
+  a three-state outcome (present with the value bytes, absent, or held
+  outside memory with the logical length); `DEL` and `EXISTS` answer
+  presence as a boolean; `SET` and `PING` answer unit on success.
+  Oversized requests refuse locally with nothing sent. Every reachable
+  server refusal maps to its structured outcome with scope: unsupported
+  operation, invalid argument, overloaded, and wrong type retire one
+  request and keep the session usable, while internal error preserves
+  ambiguity instead of resolving it. Servers at earlier revisions answer
+  each command with unsupported operation per request and the session
+  keeps serving.
+- Conformance evidence: the 107-fixture corpus, deterministic
+  duplex-peer permutation coverage, TCP permutation runs through `PING`
+  and `GET` in every scripted order, synthetic-peer refusal and
+  ambiguity suites, and black-box happy and miss paths against an
+  identified server build. Layer C passes subject to one recorded
+  exclusion: a success response carrying a payload the operation does
+  not define (non-empty `PING`, `SET`, `DEL`, or `EXISTS` success) has
+  no receiver rule at this revision, so no scenario runs for it and the
+  client accepts it without refusal pending clarification.
 
-The crate exposes no command surface. Revision `v0.4.0` assigns no
-operation beyond the handshake, so a connection connects and runs no
-operation.
-
-Do not add `rp1db` to a project that needs a working client. This version
-completes the handshake and then runs no command.
+Do not add `rp1db` to a project that needs a stable client. The API is
+pre-1.0 and the command surface covers the five core operations.
 
 ## Supported Rust version
 
@@ -92,9 +111,10 @@ when it is absent.
 The public RP-1 protocol specification is the contract this client
 implements. It is the authority for wire behavior.
 
-The `protocol` module is documented as a low-level surface. Client API
-documentation and compatibility information will be published when the
-client implements the protocol.
+The `protocol` module is documented as a low-level surface. The
+`Connection` methods document outcomes, errors, binary safety,
+concurrency, limits, ambiguity, and shutdown. Compatibility notes state
+the older-server behavior and the recorded exclusion.
 
 ## Contributing
 

@@ -1,0 +1,17 @@
+{
+  "id": "errors/detail-length-exceeds-the-payload",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "The ERROR Frame Payload",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00030000030000000300000001000000000000000400aa",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "malformed request",
+    "scope": "connection-fatal"
+  }
+}

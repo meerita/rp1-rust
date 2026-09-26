@@ -1,0 +1,19 @@
+{
+  "id": "correlation/request-frame-reusing-a-retired-id",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "Reusing a Request Id",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0001000000000000000000000200000000000000",
+    "role": "server",
+    "in_flight": []
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "unsupported operation",
+    "scope": "request-scoped",
+    "bytes_consumed": 20
+  }
+}

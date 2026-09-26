@@ -1,0 +1,17 @@
+{
+  "id": "framing/admission-order-direction-before-request-id",
+  "revision": "v0.5.0",
+  "protocol_version": 0,
+  "clause": "Frame Admission Order",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000000000000000000000000000000000000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}
