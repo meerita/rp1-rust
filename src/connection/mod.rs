@@ -694,6 +694,30 @@ impl Connection {
     pub fn admission_permits_for_test(&self) -> usize {
         self.shared.admission.available_permits()
     }
+
+    /// Marks the session unusable for tests, simulating a fatal dispatch.
+    ///
+    /// The transition stops admission and allocation, wakes every waiter
+    /// with an error, and lands the connection in
+    /// [`ConnectionState::Unusable`]. Terminal states are sticky; a usable
+    /// session never returns once it leaves usable.
+    #[cfg(test)]
+    pub fn mark_unusable_for_test(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            *state,
+            ConnectionState::Closed | ConnectionState::Failed | ConnectionState::Unusable
+        ) {
+            return;
+        }
+        *state = ConnectionState::Unusable;
+        drop(state);
+        self.shared.admission.close();
+    }
 }
 
 /// Builds the handshake request frame the offerer sends first.
@@ -1251,6 +1275,89 @@ mod tests {
         drop(second);
         assert_eq!(connection.admission_permits_for_test(), 3);
         connection.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_with_no_requests_is_orderly_and_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        assert_eq!(connection.admission_permits_for_test(), 64);
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        assert!(!connection.is_usable());
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_close_leaves_no_waiter_and_stays_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory").maximum_in_flight(1);
+        let inbound = response_frame(0, 65_536, 4_096, &[]);
+        let transport =
+            AnyTransport::Memory(InMemoryTransport::new(&inbound, 4_096, 4_096).fail_on_shutdown());
+        let connection = Connection::establish(transport, &config).await?;
+        let held = connection.acquire_admission_for_test().await?;
+        let waiter = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.acquire_admission_for_test().await.is_err() }
+        });
+        tokio::task::yield_now().await;
+        assert!(connection.close().await.is_err());
+        assert_eq!(connection.state(), ConnectionState::Failed);
+        assert!(waiter.await.unwrap_or(false));
+        drop(held);
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Failed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_fatal_dispatch_lands_unusable_and_wakes_every_waiter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory").maximum_in_flight(1);
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        let held = connection.acquire_admission_for_test().await?;
+        let waiter = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.acquire_admission_for_test().await.is_err() }
+        });
+        tokio::task::yield_now().await;
+        connection.mark_unusable_for_test();
+        assert_eq!(connection.state(), ConnectionState::Unusable);
+        assert!(!connection.is_usable());
+        assert!(waiter.await.unwrap_or(false));
+        drop(held);
+        assert!(connection.acquire_admission_for_test().await.is_err());
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Unusable);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_cycles_leave_no_residue() -> Result<(), Box<dyn std::error::Error>> {
+        for _ in [0, 1, 2] {
+            let config = ConnectionConfig::new("in-memory").maximum_in_flight(2);
+            let inbound = response_frame(0, 65_536, 4_096, &[]);
+            let transport = AnyTransport::Memory(
+                InMemoryTransport::new(&inbound, 4_096, 4_096).fail_on_shutdown(),
+            );
+            let connection = Connection::establish(transport, &config).await?;
+            assert_eq!(connection.admission_permits_for_test(), 2);
+            assert!(connection.close().await.is_err());
+            assert_eq!(connection.state(), ConnectionState::Failed);
+        }
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        assert_eq!(connection.state(), ConnectionState::Usable);
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
         Ok(())
     }
 }

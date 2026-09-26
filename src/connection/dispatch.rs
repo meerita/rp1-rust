@@ -932,4 +932,43 @@ mod tests {
         dispatcher.join().await;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn a_peer_close_with_open_requests_resolves_every_caller() -> TestResult {
+        let (dispatcher, mut peer) = test_pair();
+        let submit_a = dispatcher.execute(b"A".to_vec());
+        let submit_b = dispatcher.execute(b"B".to_vec());
+        let peer_task = tokio::spawn(async move {
+            let _ = read_requests(&mut peer, 2).await?;
+            drop(peer);
+            Ok::<(), std::io::Error>(())
+        });
+        let (outcome_a, outcome_b) = tokio::join!(submit_a, submit_b);
+        peer_task.await??;
+        assert_eq!(outcome_a, Err(RequestError::Transport));
+        assert_eq!(outcome_b, Err(RequestError::Transport));
+        assert_eq!(dispatcher.live_len(), 0);
+        dispatcher.join().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_fatal_cycles_leave_no_residue() -> TestResult {
+        for _ in [0, 1, 2] {
+            let (dispatcher, mut peer) = test_pair();
+            let submit = dispatcher.execute(b"A".to_vec());
+            let peer_task = tokio::spawn(async move {
+                let _ = read_requests(&mut peer, 1).await?;
+                let fatal = encode_test_response(9_999, b"X");
+                write_peer_bytes(&mut peer, &fatal, false).await?;
+                Ok::<(), std::io::Error>(())
+            });
+            assert_eq!(submit.await, Err(RequestError::Unusable));
+            peer_task.await??;
+            assert_eq!(dispatcher.live_len(), 0);
+            assert_eq!(dispatcher.state(), SessionState::Unusable);
+            dispatcher.join().await;
+        }
+        Ok(())
+    }
 }
