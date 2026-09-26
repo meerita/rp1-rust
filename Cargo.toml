@@ -24,7 +24,7 @@ include = [
 ]
 
 [dependencies]
-tokio = { version = "1", default-features = false, features = ["net", "io-util", "rt", "sync"] }
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "macros", "rt", "sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
