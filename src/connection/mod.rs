@@ -1,22 +1,24 @@
-//! Connection configuration and the version 0 handshake.
+//! Connection configuration, the version 0 handshake, and the core commands.
 //!
 //! A connection becomes usable only after the handshake completes. This
 //! module owns the public configuration, the connect path, the handshake
 //! exchange as untrusted input, the negotiated session state the
-//! connection exposes, and the explicit lifecycle state of the connection.
-//!
-//! It owns no command surface. A connection negotiates and closes; it runs
-//! no operation.
+//! connection exposes, the explicit lifecycle state of the connection,
+//! and the five core operations through typed binary-safe methods.
 
 mod dispatch;
+mod driver;
 
 use std::fmt;
+use std::sync::Arc;
 
 use dispatch::{InFlightRegistry, RequestIdAllocator};
+use driver::{DriverError, Submit};
 
+use crate::command;
 use crate::protocol::{
-    self, Admission, CapabilityEntries, ErrorClass, Failure, HANDSHAKE_OPCODE, HandshakeOffer,
-    HandshakeRequest, HandshakeResponse, Kind, Limits, MAX_FRAME_SIZE,
+    self, Admission, CapabilityEntries, ErrorClass, Failure, FailureScope, HANDSHAKE_OPCODE,
+    HandshakeOffer, HandshakeRequest, HandshakeResponse, Kind, Limits, MAX_FRAME_SIZE,
     MINIMUM_NEGOTIATED_FRAME_SIZE, MINIMUM_NEGOTIATED_METADATA_SIZE, Outgoing, OutgoingPayload,
     Payload, Role, Step,
 };
@@ -346,6 +348,173 @@ struct Negotiated {
     local_maximum_metadata_size: u16,
 }
 
+/// The outcome of a `GET` request.
+///
+/// A present empty value and a missing key are different variants; the
+/// caller never parses a length to tell them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GetOutcome {
+    /// The key exists and holds these value bytes, possibly empty.
+    Present(Vec<u8>),
+    /// The key does not exist.
+    Absent,
+    /// The key exists and the responder keeps its value outside memory.
+    HeldOutsideMemory {
+        /// The logical length in bytes of the value the key holds.
+        logical_length: u64,
+    },
+}
+
+/// A structured failure of one command.
+///
+/// Server refusal, server failure, transport failure, protocol failure,
+/// local refusal, and ambiguous completion stay distinguishable where
+/// the distinction affects caller behavior. Diagnostic text from the
+/// server never defines the error contract.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CommandError {
+    /// The request exceeded a local bound before any byte was sent.
+    LocalLimitExceeded {
+        /// The size the request would have occupied on the wire.
+        requested: u64,
+        /// The effective bound in force.
+        limit: u64,
+    },
+    /// The request could not be represented on the wire.
+    InvalidRequest,
+    /// The responder does not serve the named operation.
+    UnsupportedOperation,
+    /// The responder parsed the request and rejects a value it carries.
+    InvalidArgument,
+    /// The responder could not admit the resources the request needs.
+    Overloaded,
+    /// The key is held in a representation the operation does not act on.
+    WrongType,
+    /// The responder met a condition it did not anticipate.
+    ///
+    /// The mutation may have taken effect. A caller that must know
+    /// re-reads the key. This error is never retried automatically.
+    InternalError,
+    /// The peer sent data that violates the contract.
+    ProtocolViolation,
+    /// The peer could not parse the frame.
+    MalformedRequest,
+    /// A frame exceeds the maximum frame size in force.
+    ResourceLimit,
+    /// The frame names a protocol version the receiver does not implement.
+    UnsupportedProtocolVersion,
+    /// The transport failed.
+    Transport(std::io::Error),
+    /// The connection closed with the request in flight.
+    Closed,
+    /// The session became unusable after a protocol violation.
+    Unusable,
+}
+
+impl fmt::Display for CommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalLimitExceeded { requested, limit } => write!(
+                formatter,
+                "the request size {requested} exceeds the effective limit {limit}"
+            ),
+            Self::InvalidRequest => formatter.write_str("the request cannot be represented"),
+            Self::UnsupportedOperation => formatter.write_str("unsupported operation"),
+            Self::InvalidArgument => formatter.write_str("invalid argument"),
+            Self::Overloaded => formatter.write_str("overloaded"),
+            Self::WrongType => formatter.write_str("wrong type"),
+            Self::InternalError => formatter
+                .write_str("internal error: the mutation may have taken effect; re-read to decide"),
+            Self::ProtocolViolation => formatter.write_str("protocol violation"),
+            Self::MalformedRequest => formatter.write_str("malformed request"),
+            Self::ResourceLimit => formatter.write_str("resource limit"),
+            Self::UnsupportedProtocolVersion => formatter.write_str("unsupported protocol version"),
+            Self::Transport(error) => write!(formatter, "transport failure: {error}"),
+            Self::Closed => formatter.write_str("the connection closed"),
+            Self::Unusable => formatter.write_str("the session is unusable"),
+        }
+    }
+}
+
+impl std::error::Error for CommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl CommandError {
+    /// Returns whether the mutation may have taken effect.
+    ///
+    /// Only the internal error class is ambiguous at this revision;
+    /// transport, close, and unusable outcomes are also reported as
+    /// ambiguous because no terminal response establishes completion.
+    #[must_use]
+    pub const fn is_ambiguous(&self) -> bool {
+        matches!(
+            self,
+            Self::InternalError | Self::Transport(_) | Self::Closed | Self::Unusable
+        )
+    }
+
+    /// Returns the failure scope when the error carries a protocol class.
+    #[must_use]
+    pub const fn scope(&self) -> Option<FailureScope> {
+        match self {
+            Self::UnsupportedOperation
+            | Self::InvalidArgument
+            | Self::Overloaded
+            | Self::WrongType
+            | Self::InternalError => Some(FailureScope::RequestScoped),
+            Self::ProtocolViolation
+            | Self::MalformedRequest
+            | Self::ResourceLimit
+            | Self::UnsupportedProtocolVersion => Some(FailureScope::ConnectionFatal),
+            _ => None,
+        }
+    }
+
+    const fn from_class(class: ErrorClass) -> Self {
+        match class {
+            ErrorClass::MalformedRequest => Self::MalformedRequest,
+            ErrorClass::UnsupportedProtocolVersion => Self::UnsupportedProtocolVersion,
+            ErrorClass::UnsupportedOperation => Self::UnsupportedOperation,
+            ErrorClass::InvalidArgument => Self::InvalidArgument,
+            ErrorClass::ResourceLimit => Self::ResourceLimit,
+            ErrorClass::Overloaded => Self::Overloaded,
+            ErrorClass::InternalError => Self::InternalError,
+            ErrorClass::ProtocolViolation => Self::ProtocolViolation,
+            ErrorClass::WrongType => Self::WrongType,
+        }
+    }
+
+    const fn from_failure(failure: Failure) -> Self {
+        Self::from_class(failure.class())
+    }
+
+    const fn from_command_failure(failure: command::CommandFailure) -> Self {
+        Self::from_class(failure.class())
+    }
+
+    fn from_driver(error: DriverError) -> Self {
+        match error {
+            DriverError::RequestFailed(failure) | DriverError::ConnectionFatal(failure) => {
+                Self::from_failure(failure)
+            }
+            DriverError::Transport => Self::Transport(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the transport failed",
+            )),
+            DriverError::Closed => Self::Closed,
+            DriverError::Unusable => Self::Unusable,
+        }
+    }
+}
+
 /// The lifecycle state of a connection.
 ///
 /// A connection is usable only after the handshake completes. Closing runs
@@ -361,8 +530,7 @@ struct Negotiated {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionState {
-    /// The handshake completed and the connection accepts no new work yet
-    /// runs no command; it is open and has not entered shutdown or failure.
+    /// The handshake completed; the connection accepts new requests.
     Usable,
     /// An explicit shutdown started and the transport close is pending.
     Closing,
@@ -397,8 +565,8 @@ impl ConnectionState {
 /// A usable protocol version 0 connection.
 ///
 /// A `Connection` is returned only after the handshake completes. It owns
-/// its transport and its negotiated session state. It exposes no command;
-/// a later revision adds the command surface.
+/// its negotiated session state and carries multiplexed requests with
+/// bounded admission. Clones share one session.
 ///
 /// A clone is another handle to the same session, never a new connection.
 /// Clones share admission, request identity, negotiated state, and
@@ -419,10 +587,24 @@ pub struct Connection {
 #[derive(Debug)]
 struct Shared {
     negotiated: Negotiated,
-    state: std::sync::Mutex<ConnectionState>,
+    state: std::sync::Arc<std::sync::Mutex<ConnectionState>>,
     transport: std::sync::Mutex<Option<AnyTransport>>,
     admission: std::sync::Arc<tokio::sync::Semaphore>,
     maximum_in_flight: usize,
+    submit_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Submit>>>,
+    allocator: std::sync::Mutex<RequestIdAllocator>,
+    driver: std::sync::Mutex<Option<tokio::task::JoinHandle<driver::DriverExit>>>,
+    shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.driver.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 impl Connection {
@@ -490,12 +672,58 @@ impl Connection {
             });
         }
         let bound = config.maximum_in_flight_value();
+        let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(bound));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ConnectionState::Usable));
+        let is_tcp = matches!(transport, AnyTransport::Tcp(_));
+        if is_tcp {
+            let limits = Limits {
+                frame_size: negotiated
+                    .maximum_frame_size
+                    .min(config.local_maximum_frame_size_value()),
+                metadata_size: negotiated
+                    .maximum_metadata_size
+                    .min(config.local_maximum_metadata_size_value()),
+            };
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let (submit_tx, driver_handle) = driver::spawn(
+                transport,
+                limits,
+                Arc::clone(&state),
+                Arc::clone(&admission),
+                shutdown_rx,
+            );
+            let shared = Shared {
+                negotiated,
+                state,
+                transport: std::sync::Mutex::new(None),
+                admission,
+                maximum_in_flight: bound,
+                submit_tx: std::sync::Mutex::new(Some(submit_tx)),
+                allocator: std::sync::Mutex::new(RequestIdAllocator::new()),
+                driver: std::sync::Mutex::new(Some(driver_handle)),
+                shutdown_tx: std::sync::Mutex::new(Some(shutdown_tx)),
+            };
+            {
+                let mut allocator_guard = shared
+                    .allocator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = allocator_guard.allocate();
+            }
+            return Ok(Self {
+                shared: std::sync::Arc::new(shared),
+            });
+        }
         let shared = Shared {
             negotiated,
-            state: std::sync::Mutex::new(ConnectionState::Usable),
+            state,
             transport: std::sync::Mutex::new(Some(transport)),
-            admission: std::sync::Arc::new(tokio::sync::Semaphore::new(bound)),
+            admission,
             maximum_in_flight: bound,
+            submit_tx: std::sync::Mutex::new(None),
+            allocator: std::sync::Mutex::new(RequestIdAllocator::new()),
+            driver: std::sync::Mutex::new(None),
+            shutdown_tx: std::sync::Mutex::new(None),
         };
         Ok(Self {
             shared: std::sync::Arc::new(shared),
@@ -591,6 +819,271 @@ impl Connection {
         self.state().is_usable()
     }
 
+    /// Sends a liveness probe and waits for the responder to answer.
+    ///
+    /// Keys and values are binary-safe on every command; `PING` names no
+    /// key. Concurrent calls through clones multiplex over one session
+    /// with no exclusive borrow and no submission-order consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandError::LocalLimitExceeded`] when the request would
+    /// exceed the effective bound without sending a byte,
+    /// [`CommandError::UnsupportedOperation`] when the server does not
+    /// serve the operation, request-scoped refusals for invalid or
+    /// overloaded requests, [`CommandError::InternalError`] with preserved
+    /// ambiguity when the responder reports an unexpected condition, and
+    /// connection-fatal, transport, closed, or unusable errors when the
+    /// session cannot serve the request.
+    pub async fn ping(&self) -> Result<(), CommandError> {
+        let payload = command::encode_ping();
+        let (_, frame_bytes) = self.execute(command::PING_OPCODE, &payload).await?;
+        let frame = self.decode_own(&frame_bytes)?;
+        command::interpret_ping(&frame).map_err(CommandError::from_command_failure)
+    }
+
+    /// Reads the value of `key`, which is an opaque byte string.
+    ///
+    /// A present empty value and a missing key are different outcomes;
+    /// the caller never parses a length to tell them apart. Arbitrary
+    /// bytes round-trip untouched in both directions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structured errors as [`Connection::ping`].
+    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<GetOutcome, CommandError> {
+        let payload = command::encode_key(key.as_ref());
+        let (_, frame_bytes) = self.execute(command::GET_OPCODE, &payload).await?;
+        let frame = self.decode_own(&frame_bytes)?;
+        match command::interpret_get(&frame).map_err(CommandError::from_command_failure)? {
+            command::GetOutcome::Present(value) => Ok(GetOutcome::Present(value)),
+            command::GetOutcome::Absent => Ok(GetOutcome::Absent),
+            command::GetOutcome::HeldOutsideMemory { logical_length } => {
+                Ok(GetOutcome::HeldOutsideMemory { logical_length })
+            }
+        }
+    }
+
+    /// Writes `value` under `key`; both are opaque byte strings.
+    ///
+    /// An empty key and an empty value are ordinary values. Nothing is
+    /// sent when the request would exceed the effective bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structured errors as [`Connection::ping`], plus
+    /// [`CommandError::WrongType`] when the key holds another
+    /// representation and nothing was stored.
+    pub async fn set(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<(), CommandError> {
+        let payload = command::encode_set(key.as_ref(), value.as_ref())
+            .map_err(|_| CommandError::InvalidRequest)?;
+        let (_, frame_bytes) = self.execute(command::SET_OPCODE, &payload).await?;
+        let frame = self.decode_own(&frame_bytes)?;
+        command::interpret_set(&frame).map_err(CommandError::from_command_failure)
+    }
+
+    /// Removes `key` and answers whether a key was removed.
+    ///
+    /// Removing a missing key answers `false`, never an error. `DEL`
+    /// removes whichever representation the key holds, so it never
+    /// answers the wrong type class.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structured errors as [`Connection::ping`].
+    pub async fn del(&self, key: impl AsRef<[u8]>) -> Result<bool, CommandError> {
+        let payload = command::encode_key(key.as_ref());
+        let (_, frame_bytes) = self.execute(command::DEL_OPCODE, &payload).await?;
+        let frame = self.decode_own(&frame_bytes)?;
+        command::interpret_del(&frame).map_err(CommandError::from_command_failure)
+    }
+
+    /// Answers whether `key` is present, whatever representation it holds.
+    ///
+    /// Presence arrives as a boolean; a missing key is `false`, never an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structured errors as [`Connection::ping`].
+    pub async fn exists(&self, key: impl AsRef<[u8]>) -> Result<bool, CommandError> {
+        let payload = command::encode_key(key.as_ref());
+        let (_, frame_bytes) = self.execute(command::EXISTS_OPCODE, &payload).await?;
+        let frame = self.decode_own(&frame_bytes)?;
+        command::interpret_exists(&frame).map_err(CommandError::from_command_failure)
+    }
+
+    /// Executes one encoded command payload and returns the terminal frame.
+    async fn execute(&self, opcode: u16, payload: &[u8]) -> Result<(u64, Vec<u8>), CommandError> {
+        self.check_usable()?;
+        let (effective_frame, effective_metadata) = self.effective_limits();
+        let total = wire_size(payload.len());
+        if total > effective_frame {
+            return Err(CommandError::LocalLimitExceeded {
+                requested: total,
+                limit: effective_frame,
+            });
+        }
+        let permit = self.acquire_permit().await?;
+        let id = self.allocate_id()?;
+        let bytes = Self::encode_request(opcode, payload, id, effective_frame, effective_metadata)?;
+        self.submit(id, bytes, permit).await
+    }
+
+    /// Refuses new work unless the session is usable.
+    fn check_usable(&self) -> Result<(), CommandError> {
+        if self.is_usable() {
+            return Ok(());
+        }
+        Err(match self.state() {
+            ConnectionState::Closed | ConnectionState::Closing => CommandError::Closed,
+            ConnectionState::Failed => CommandError::Transport(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the connection failed",
+            )),
+            ConnectionState::Unusable | ConnectionState::Usable => CommandError::Unusable,
+        })
+    }
+
+    /// Returns the effective frame and metadata bounds in force.
+    fn effective_limits(&self) -> (u64, u16) {
+        (
+            self.effective_maximum_frame_size(),
+            self.effective_maximum_metadata_size(),
+        )
+    }
+
+    /// Acquires one admission permit, waiting while usable.
+    async fn acquire_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, CommandError> {
+        Arc::clone(&self.shared.admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| match self.state() {
+                ConnectionState::Closed | ConnectionState::Closing => CommandError::Closed,
+                ConnectionState::Failed => CommandError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "the connection failed",
+                )),
+                _ => CommandError::Unusable,
+            })
+    }
+
+    /// Allocates the next request ID.
+    fn allocate_id(&self) -> Result<u64, CommandError> {
+        let id = self
+            .shared
+            .allocator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .allocate();
+        if id == 0 {
+            return Err(CommandError::Unusable);
+        }
+        Ok(id)
+    }
+
+    /// Encodes one request frame under the effective bounds.
+    fn encode_request(
+        opcode: u16,
+        payload: &[u8],
+        id: u64,
+        effective_frame: u64,
+        effective_metadata: u16,
+    ) -> Result<Vec<u8>, CommandError> {
+        let outgoing = Outgoing {
+            kind: Kind::Request,
+            code: opcode,
+            request_id: id,
+            metadata: &[],
+            payload: OutgoingPayload::Opaque(payload),
+        };
+        crate::protocol::encode_with_max(&outgoing, effective_frame, effective_metadata).map_err(
+            |error| match error {
+                protocol::EncodeError::FrameTooLarge | protocol::EncodeError::MetadataTooLarge => {
+                    CommandError::LocalLimitExceeded {
+                        requested: wire_size(payload.len()),
+                        limit: effective_frame,
+                    }
+                }
+                protocol::EncodeError::MetadataNotAscending => CommandError::InvalidRequest,
+            },
+        )
+    }
+
+    /// Submits encoded bytes and waits for the terminal frame.
+    async fn submit(
+        &self,
+        id: u64,
+        bytes: Vec<u8>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(u64, Vec<u8>), CommandError> {
+        let submit_tx = {
+            let guard = self
+                .shared
+                .submit_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.clone()
+        };
+        let Some(submit_tx) = submit_tx else {
+            return Err(CommandError::Unusable);
+        };
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let submit = Submit {
+            id,
+            bytes,
+            completion: completion_tx,
+        };
+        if submit_tx.send(submit).await.is_err() {
+            return Err(self.completion_lost());
+        }
+        let outcome = completion_rx.await.map_err(|_| self.completion_lost())?;
+        match outcome {
+            Ok(frame_bytes) => Ok((id, frame_bytes)),
+            Err(driver_error) => Err(CommandError::from_driver(driver_error)),
+        }
+    }
+
+    /// Maps a lost completion to the current lifecycle state.
+    fn completion_lost(&self) -> CommandError {
+        match self.state() {
+            ConnectionState::Closed | ConnectionState::Closing => CommandError::Closed,
+            ConnectionState::Failed => CommandError::Transport(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the connection failed",
+            )),
+            _ => CommandError::Unusable,
+        }
+    }
+
+    /// Decodes a terminal frame the driver attributed to one request.
+    fn decode_own<'a>(&self, frame_bytes: &'a [u8]) -> Result<protocol::Frame<'a>, CommandError> {
+        use protocol::{Admission, ConnectionState as ProtocolState, Limits, Role};
+        let request_id = frame_bytes
+            .get(12..20)
+            .and_then(|slice| <[u8; 8]>::try_from(slice).ok())
+            .map_or(0, u64::from_le_bytes);
+        let in_flight = [request_id];
+        let admission = Admission {
+            role: Role::Client,
+            state: ProtocolState::Negotiated,
+            limits: Limits {
+                frame_size: self.effective_maximum_frame_size(),
+                metadata_size: self.effective_maximum_metadata_size(),
+            },
+            in_flight: &in_flight,
+        };
+        match protocol::decode(frame_bytes, admission) {
+            Step::Frame(frame) => Ok(frame),
+            Step::Failure { failure, .. } => Err(CommandError::from_failure(failure)),
+            Step::Need(_) => Err(CommandError::ProtocolViolation),
+        }
+    }
+
     /// Closes the connection.
     ///
     /// Closing stops admission, wakes every admission waiter with a
@@ -606,28 +1099,105 @@ impl Connection {
     /// Returns the underlying transport error, leaving the connection in
     /// the failed state.
     pub async fn close(&self) -> Result<(), std::io::Error> {
-        {
-            let state = self
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if matches!(
-                *state,
-                ConnectionState::Closed | ConnectionState::Failed | ConnectionState::Unusable
-            ) {
-                return Ok(());
-            }
+        if self.is_terminal() {
+            return Ok(());
         }
-        {
-            let mut state = self
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *state = ConnectionState::Closing;
-        }
+        self.begin_closing();
         self.shared.admission.close();
+        if self.has_driver() {
+            return self.close_with_driver().await;
+        }
+        self.close_without_driver().await
+    }
+
+    /// Returns whether the session already reached a terminal state.
+    fn is_terminal(&self) -> bool {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        matches!(
+            *state,
+            ConnectionState::Closed | ConnectionState::Failed | ConnectionState::Unusable
+        )
+    }
+
+    /// Moves a usable session into closing.
+    fn begin_closing(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = ConnectionState::Closing;
+    }
+
+    /// Returns whether a production driver owns the transport.
+    fn has_driver(&self) -> bool {
+        let guard = self
+            .shared
+            .driver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.is_some()
+    }
+
+    /// Shuts down through the driver and lands the terminal state.
+    async fn close_with_driver(&self) -> Result<(), std::io::Error> {
+        let shutdown_tx = {
+            let mut guard = self
+                .shared
+                .shutdown_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.take()
+        };
+        if let Some(shutdown_tx) = shutdown_tx {
+            let _ = shutdown_tx.send(());
+        }
+        let handle = {
+            let mut guard = self
+                .shared
+                .driver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.take()
+        };
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        match handle.await {
+            Ok(driver::DriverExit::Closed) => {
+                self.finish_close(ConnectionState::Closed);
+                Ok(())
+            }
+            Ok(driver::DriverExit::Failed) => {
+                self.finish_close(ConnectionState::Failed);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the transport failed during shutdown",
+                ))
+            }
+            Ok(driver::DriverExit::Unusable) | Err(_) => Ok(()),
+        }
+    }
+
+    /// Lands a terminal state after the driver exited, unless fatal first.
+    fn finish_close(&self, next: ConnectionState) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, ConnectionState::Closing) {
+            *state = next;
+        }
+        drop(state);
+    }
+
+    /// Shuts down a driverless test session through its transport.
+    async fn close_without_driver(&self) -> Result<(), std::io::Error> {
         let transport = {
             let mut guard = self
                 .shared
@@ -718,6 +1288,14 @@ impl Connection {
         drop(state);
         self.shared.admission.close();
     }
+}
+
+/// Returns the wire size of a command payload with an empty metadata region.
+fn wire_size(payload_len: usize) -> u64 {
+    u64::try_from(crate::protocol::HEADER_LENGTH)
+        .ok()
+        .and_then(|header| header.checked_add(u64::try_from(payload_len).unwrap_or(u64::MAX)))
+        .unwrap_or(u64::MAX)
 }
 
 /// Builds the handshake request frame the offerer sends first.

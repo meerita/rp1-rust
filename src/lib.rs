@@ -19,5 +19,6 @@ mod command;
 mod transport;
 
 pub use connection::{
-    ConnectError, Connection, ConnectionConfig, ConnectionConfigError, ConnectionState,
+    CommandError, ConnectError, Connection, ConnectionConfig, ConnectionConfigError,
+    ConnectionState, GetOutcome,
 };

@@ -1237,7 +1237,25 @@ fn admit(input: &[u8], role: Role, limits: Limits) -> Result<Admitted<'_>, Step<
 /// [`EncodeError::FrameTooLarge`] when the total length exceeds the maximum
 /// frame size or a payload field cannot be represented.
 pub fn encode(outgoing: &Outgoing<'_>) -> Result<Vec<u8>, EncodeError> {
-    let metadata_length = checked_metadata_length(outgoing.metadata)?;
+    encode_with_max(outgoing, MAX_FRAME_SIZE, MAX_METADATA_SIZE)
+}
+
+/// Encodes a frame under explicit size bounds and returns its exact bytes.
+///
+/// The bounds are the effective limits in force on the connection that
+/// sends the frame, typically the stricter of the negotiated and local
+/// caps. The pre-negotiation constants apply before the handshake.
+///
+/// # Errors
+///
+/// Returns the same variants as [`encode`], evaluated against the given
+/// bounds instead of the pre-negotiation constants.
+pub fn encode_with_max(
+    outgoing: &Outgoing<'_>,
+    max_frame_size: u64,
+    max_metadata_size: u16,
+) -> Result<Vec<u8>, EncodeError> {
+    let metadata_length = checked_metadata_length_with_max(outgoing.metadata, max_metadata_size)?;
     let payload = encode_payload(outgoing.payload)?;
     let payload_length = u32::try_from(payload.len()).map_err(|_| EncodeError::FrameTooLarge)?;
     let frame_total = u64::try_from(HEADER_LENGTH)
@@ -1245,7 +1263,7 @@ pub fn encode(outgoing: &Outgoing<'_>) -> Result<Vec<u8>, EncodeError> {
         .and_then(|header| header.checked_add(metadata_length))
         .and_then(|total| total.checked_add(u64::from(payload_length)))
         .ok_or(EncodeError::FrameTooLarge)?;
-    if frame_total > MAX_FRAME_SIZE {
+    if frame_total > max_frame_size {
         return Err(EncodeError::FrameTooLarge);
     }
     let metadata_len = u16::try_from(metadata_length).map_err(|_| EncodeError::MetadataTooLarge)?;
@@ -1515,8 +1533,11 @@ const fn retires_for(kind: Kind, correlation: Correlation, request_id: u64) -> R
     }
 }
 
-/// Sums the encoded metadata region and enforces its bound.
-fn checked_metadata_length(metadata: &[(u16, &[u8])]) -> Result<u64, EncodeError> {
+/// Sums the encoded metadata region and enforces the given bound.
+fn checked_metadata_length_with_max(
+    metadata: &[(u16, &[u8])],
+    max_metadata_size: u16,
+) -> Result<u64, EncodeError> {
     let mut previous: Option<u16> = None;
     let mut length: u64 = 0;
     for (identifier, value) in metadata {
@@ -1534,7 +1555,7 @@ fn checked_metadata_length(metadata: &[(u16, &[u8])]) -> Result<u64, EncodeError
             .ok_or(EncodeError::MetadataTooLarge)?;
         previous = Some(*identifier);
     }
-    if length > u64::from(MAX_METADATA_SIZE) {
+    if length > u64::from(max_metadata_size) {
         return Err(EncodeError::MetadataTooLarge);
     }
     Ok(length)
