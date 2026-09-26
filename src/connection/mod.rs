@@ -8,7 +8,11 @@
 //! It owns no command surface. A connection negotiates and closes; it runs
 //! no operation.
 
+mod dispatch;
+
 use std::fmt;
+
+use dispatch::{InFlightRegistry, RequestIdAllocator};
 
 use crate::protocol::{
     self, Admission, CapabilityEntries, ErrorClass, Failure, HANDSHAKE_OPCODE, HandshakeOffer,
@@ -40,6 +44,12 @@ const DEFAULT_LOCAL_MAXIMUM_FRAME_SIZE: u64 = MINIMUM_NEGOTIATED_FRAME_SIZE;
 /// The default local cap on the negotiated maximum metadata size.
 const DEFAULT_LOCAL_MAXIMUM_METADATA_SIZE: u16 = MINIMUM_NEGOTIATED_METADATA_SIZE;
 
+/// The default bound on concurrent in-flight requests.
+const DEFAULT_MAXIMUM_IN_FLIGHT: usize = 64;
+
+/// The minimum bound on concurrent in-flight requests.
+const MINIMUM_MAXIMUM_IN_FLIGHT: usize = 1;
+
 /// A failure a connection configuration can describe before any connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -60,6 +70,11 @@ pub enum ConnectionConfigError {
     LocalMetadataSizeBelowFloor {
         /// The proposed value.
         proposed: u16,
+    },
+    /// The maximum in-flight bound lies below the minimum of 1.
+    InFlightBoundBelowMinimum {
+        /// The proposed value.
+        proposed: usize,
     },
 }
 
@@ -85,6 +100,12 @@ impl fmt::Display for ConnectionConfigError {
                     "the local maximum metadata size {proposed} is below the floor 4096"
                 )
             }
+            Self::InFlightBoundBelowMinimum { proposed } => {
+                write!(
+                    formatter,
+                    "the maximum in-flight bound {proposed} is below the minimum 1"
+                )
+            }
         }
     }
 }
@@ -100,12 +121,19 @@ impl std::error::Error for ConnectionConfigError {}
 /// connection never becomes usable. The local caps never raise a
 /// negotiated bound; the effective bound in force is the stricter of the
 /// two.
+///
+/// The maximum in-flight bound caps how many requests may be admitted at
+/// once on one connection. A full connection applies backpressure by
+/// waiting while usable; failure or shutdown wakes every waiter with a
+/// structured error. The default of 64 aligns with the default server
+/// admission in evidence and stays proportional in bookkeeping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionConfig {
     endpoint: String,
     desired_maximum_frame_size: u32,
     local_maximum_frame_size: u64,
     local_maximum_metadata_size: u16,
+    maximum_in_flight: usize,
 }
 
 impl ConnectionConfig {
@@ -117,6 +145,7 @@ impl ConnectionConfig {
             desired_maximum_frame_size: DEFAULT_DESIRED_MAXIMUM_FRAME_SIZE,
             local_maximum_frame_size: DEFAULT_LOCAL_MAXIMUM_FRAME_SIZE,
             local_maximum_metadata_size: DEFAULT_LOCAL_MAXIMUM_METADATA_SIZE,
+            maximum_in_flight: DEFAULT_MAXIMUM_IN_FLIGHT,
         }
     }
 
@@ -145,6 +174,17 @@ impl ConnectionConfig {
         self
     }
 
+    /// Sets the bound on concurrent in-flight requests.
+    ///
+    /// The minimum is 1. A bound of 1 serializes admission without
+    /// deadlock; the default of 64 keeps bookkeeping proportional to the
+    /// bound.
+    #[must_use]
+    pub const fn maximum_in_flight(mut self, value: usize) -> Self {
+        self.maximum_in_flight = value;
+        self
+    }
+
     /// Returns the endpoint the configuration names.
     #[must_use]
     pub fn endpoint(&self) -> &str {
@@ -169,14 +209,22 @@ impl ConnectionConfig {
         self.local_maximum_metadata_size
     }
 
+    /// Returns the bound on concurrent in-flight requests.
+    #[must_use]
+    pub const fn maximum_in_flight_value(&self) -> usize {
+        self.maximum_in_flight
+    }
+
     /// Validates the configuration before any connection is opened.
     ///
     /// # Errors
     ///
     /// Returns [`ConnectionConfigError::EmptyEndpoint`] when the endpoint is
     /// empty, [`ConnectionConfigError::FrameSizeBelowFloor`] when the
-    /// desired maximum frame size lies below the protocol floor, and the
-    /// local variants when a local cap lies below its protocol floor.
+    /// desired maximum frame size lies below the protocol floor, the local
+    /// variants when a local cap lies below its protocol floor, and
+    /// [`ConnectionConfigError::InFlightBoundBelowMinimum`] when the
+    /// in-flight bound lies below 1.
     pub fn validate(&self) -> Result<(), ConnectionConfigError> {
         if self.endpoint.trim().is_empty() {
             return Err(ConnectionConfigError::EmptyEndpoint);
@@ -194,6 +242,11 @@ impl ConnectionConfig {
         if self.local_maximum_metadata_size < MINIMUM_NEGOTIATED_METADATA_SIZE {
             return Err(ConnectionConfigError::LocalMetadataSizeBelowFloor {
                 proposed: self.local_maximum_metadata_size,
+            });
+        }
+        if self.maximum_in_flight < MINIMUM_MAXIMUM_IN_FLIGHT {
+            return Err(ConnectionConfigError::InFlightBoundBelowMinimum {
+                proposed: self.maximum_in_flight,
             });
         }
         Ok(())
@@ -347,15 +400,29 @@ impl ConnectionState {
 /// its transport and its negotiated session state. It exposes no command;
 /// a later revision adds the command surface.
 ///
+/// A clone is another handle to the same session, never a new connection.
+/// Clones share admission, request identity, negotiated state, and
+/// lifecycle: closing through any handle closes the session for all
+/// handles, and concurrent tasks may use clones without an exclusive
+/// borrow.
+///
 /// Dropping a `Connection` without calling [`Connection::close`] closes
 /// the transport without waiting and releases local resources. It sends
 /// no protocol exchange and rolls nothing back. Callers that need a
 /// deterministic shutdown call `close`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Connection {
-    transport: AnyTransport,
+    shared: std::sync::Arc<Shared>,
+}
+
+/// The session state shared by every handle to one connection.
+#[derive(Debug)]
+struct Shared {
     negotiated: Negotiated,
-    state: ConnectionState,
+    state: std::sync::Mutex<ConnectionState>,
+    transport: std::sync::Mutex<Option<AnyTransport>>,
+    admission: std::sync::Arc<tokio::sync::Semaphore>,
+    maximum_in_flight: usize,
 }
 
 impl Connection {
@@ -387,9 +454,27 @@ impl Connection {
         mut transport: AnyTransport,
         config: &ConnectionConfig,
     ) -> Result<Self, ConnectError> {
-        let frame = build_handshake_request(config)?;
+        let mut allocator = RequestIdAllocator::new();
+        let mut in_flight = InFlightRegistry::new();
+        let handshake_id = allocator.allocate();
+        if handshake_id != HANDSHAKE_REQUEST_ID {
+            return Err(ConnectError::HandshakeFailure(Failure::protocol_violation()));
+        }
+        if in_flight.insert(handshake_id).is_err() {
+            return Err(ConnectError::HandshakeFailure(Failure::protocol_violation()));
+        }
+        let frame = build_handshake_request(config, handshake_id)?;
         write_all(&mut transport, &frame).await?;
-        let negotiated = read_handshake_response(&mut transport, config).await?;
+        let negotiated = read_handshake_response(&mut transport, config, handshake_id).await?;
+        let _ = in_flight.retire(handshake_id);
+        let live = in_flight.live_ids();
+        if in_flight.contains(handshake_id)
+            || !in_flight.is_empty()
+            || in_flight.len() != live.len()
+            || !live.is_empty()
+        {
+            return Err(ConnectError::HandshakeFailure(Failure::protocol_violation()));
+        }
         if negotiated.maximum_frame_size > config.local_maximum_frame_size_value() {
             let _ = transport.shutdown().await;
             return Err(ConnectError::NegotiatedFrameSizeAboveLocal {
@@ -404,41 +489,53 @@ impl Connection {
                 local: config.local_maximum_metadata_size_value(),
             });
         }
-        Ok(Self {
-            transport,
+        let bound = config.maximum_in_flight_value();
+        let shared = Shared {
             negotiated,
-            state: ConnectionState::Usable,
+            state: std::sync::Mutex::new(ConnectionState::Usable),
+            transport: std::sync::Mutex::new(Some(transport)),
+            admission: std::sync::Arc::new(tokio::sync::Semaphore::new(bound)),
+            maximum_in_flight: bound,
+        };
+        Ok(Self {
+            shared: std::sync::Arc::new(shared),
         })
     }
 
     /// Returns the negotiated protocol version.
     #[must_use]
-    pub const fn protocol_version(&self) -> u16 {
-        self.negotiated.protocol_version
+    pub fn protocol_version(&self) -> u16 {
+        self.shared.negotiated.protocol_version
     }
 
     /// Returns the negotiated maximum frame size.
     #[must_use]
-    pub const fn maximum_frame_size(&self) -> u64 {
-        self.negotiated.maximum_frame_size
+    pub fn maximum_frame_size(&self) -> u64 {
+        self.shared.negotiated.maximum_frame_size
     }
 
     /// Returns the negotiated maximum metadata size.
     #[must_use]
-    pub const fn maximum_metadata_size(&self) -> u16 {
-        self.negotiated.maximum_metadata_size
+    pub fn maximum_metadata_size(&self) -> u16 {
+        self.shared.negotiated.maximum_metadata_size
     }
 
     /// Returns the local cap on the negotiated maximum frame size.
     #[must_use]
-    pub const fn local_maximum_frame_size(&self) -> u64 {
-        self.negotiated.local_maximum_frame_size
+    pub fn local_maximum_frame_size(&self) -> u64 {
+        self.shared.negotiated.local_maximum_frame_size
     }
 
     /// Returns the local cap on the negotiated maximum metadata size.
     #[must_use]
-    pub const fn local_maximum_metadata_size(&self) -> u16 {
-        self.negotiated.local_maximum_metadata_size
+    pub fn local_maximum_metadata_size(&self) -> u16 {
+        self.shared.negotiated.local_maximum_metadata_size
+    }
+
+    /// Returns the bound on concurrent in-flight requests.
+    #[must_use]
+    pub fn maximum_in_flight(&self) -> usize {
+        self.shared.maximum_in_flight
     }
 
     /// Returns the effective maximum frame size: the stricter of the
@@ -449,75 +546,185 @@ impl Connection {
     /// negotiated one. Later request admission reads this bound rather
     /// than the negotiated value alone.
     #[must_use]
-    pub const fn effective_maximum_frame_size(&self) -> u64 {
-        if self.negotiated.maximum_frame_size < self.negotiated.local_maximum_frame_size {
-            self.negotiated.maximum_frame_size
+    pub fn effective_maximum_frame_size(&self) -> u64 {
+        if self.shared.negotiated.maximum_frame_size
+            < self.shared.negotiated.local_maximum_frame_size
+        {
+            self.shared.negotiated.maximum_frame_size
         } else {
-            self.negotiated.local_maximum_frame_size
+            self.shared.negotiated.local_maximum_frame_size
         }
     }
 
     /// Returns the effective maximum metadata size: the stricter of the
     /// negotiated bound and the local cap.
     #[must_use]
-    pub const fn effective_maximum_metadata_size(&self) -> u16 {
-        if self.negotiated.maximum_metadata_size < self.negotiated.local_maximum_metadata_size {
-            self.negotiated.maximum_metadata_size
+    pub fn effective_maximum_metadata_size(&self) -> u16 {
+        if self.shared.negotiated.maximum_metadata_size
+            < self.shared.negotiated.local_maximum_metadata_size
+        {
+            self.shared.negotiated.maximum_metadata_size
         } else {
-            self.negotiated.local_maximum_metadata_size
+            self.shared.negotiated.local_maximum_metadata_size
         }
     }
 
     /// Returns the accepted capability identifiers.
     #[must_use]
     pub fn accepted_capabilities(&self) -> &[u16] {
-        &self.negotiated.accepted_capabilities
+        &self.shared.negotiated.accepted_capabilities
     }
 
     /// Returns the lifecycle state of the connection.
     #[must_use]
-    pub const fn state(&self) -> ConnectionState {
-        self.state
+    pub fn state(&self) -> ConnectionState {
+        *self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Returns whether the connection is usable. This is false after close.
     #[must_use]
-    pub const fn is_usable(&self) -> bool {
-        self.state.is_usable()
+    pub fn is_usable(&self) -> bool {
+        self.state().is_usable()
     }
 
     /// Closes the connection.
     ///
-    /// Closing stops admission, shuts the transport down, and moves the
+    /// Closing stops admission, wakes every admission waiter with a
+    /// structured error, shuts the transport down, and moves the
     /// connection to [`ConnectionState::Closed`]. When the transport
     /// shutdown fails, the connection moves to [`ConnectionState::Failed`]
-    /// instead and the error is returned. Closing an already closed
-    /// connection succeeds without touching the transport.
+    /// instead and the error is returned. Closing an already terminal
+    /// connection succeeds without touching the transport. A clone closes
+    /// the shared session for every handle.
     ///
     /// # Errors
     ///
     /// Returns the underlying transport error, leaving the connection in
     /// the failed state.
-    pub async fn close(&mut self) -> Result<(), std::io::Error> {
-        if self.state == ConnectionState::Closed {
-            return Ok(());
+    pub async fn close(&self) -> Result<(), std::io::Error> {
+        {
+            let state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(
+                *state,
+                ConnectionState::Closed | ConnectionState::Failed | ConnectionState::Unusable
+            ) {
+                return Ok(());
+            }
         }
-        self.state = ConnectionState::Closing;
-        match self.transport.shutdown().await {
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *state = ConnectionState::Closing;
+        }
+        self.shared.admission.close();
+        let transport = {
+            let mut guard = self
+                .shared
+                .transport
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.take()
+        };
+        let Some(mut transport) = transport else {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *state = ConnectionState::Closed;
+            drop(state);
+            return Ok(());
+        };
+        match transport.shutdown().await {
             Ok(()) => {
-                self.state = ConnectionState::Closed;
+                let mut state = self
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *state = ConnectionState::Closed;
+                drop(state);
                 Ok(())
             }
             Err(error) => {
-                self.state = ConnectionState::Failed;
+                let mut state = self
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *state = ConnectionState::Failed;
+                drop(state);
                 Err(error)
             }
         }
     }
+
+    /// Acquires one admission permit for tests, waiting while usable.
+    ///
+    /// Failure or shutdown closes the admission source and wakes the
+    /// waiter with an error, so no waiter survives termination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`tokio::sync::AcquireError`] when the admission source is
+    /// closed by failure or shutdown.
+    #[cfg(test)]
+    pub async fn acquire_admission_for_test(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        std::sync::Arc::clone(&self.shared.admission)
+            .acquire_owned()
+            .await
+    }
+
+    /// Returns the available admission permits for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn admission_permits_for_test(&self) -> usize {
+        self.shared.admission.available_permits()
+    }
+
+    /// Marks the session unusable for tests, simulating a fatal dispatch.
+    ///
+    /// The transition stops admission and allocation, wakes every waiter
+    /// with an error, and lands the connection in
+    /// [`ConnectionState::Unusable`]. Terminal states are sticky; a usable
+    /// session never returns once it leaves usable.
+    #[cfg(test)]
+    pub fn mark_unusable_for_test(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            *state,
+            ConnectionState::Closed | ConnectionState::Failed | ConnectionState::Unusable
+        ) {
+            return;
+        }
+        *state = ConnectionState::Unusable;
+        drop(state);
+        self.shared.admission.close();
+    }
 }
 
 /// Builds the handshake request frame the offerer sends first.
-fn build_handshake_request(config: &ConnectionConfig) -> Result<Vec<u8>, ConnectError> {
+fn build_handshake_request(
+    config: &ConnectionConfig,
+    request_id: u64,
+) -> Result<Vec<u8>, ConnectError> {
     let request = HandshakeRequest::new(
         0,
         0,
@@ -528,7 +735,7 @@ fn build_handshake_request(config: &ConnectionConfig) -> Result<Vec<u8>, Connect
     let outgoing = Outgoing {
         kind: Kind::Request,
         code: HANDSHAKE_OPCODE,
-        request_id: HANDSHAKE_REQUEST_ID,
+        request_id,
         metadata: &[],
         payload: OutgoingPayload::Opaque(&payload),
     };
@@ -568,6 +775,7 @@ async fn write_all(transport: &mut AnyTransport, bytes: &[u8]) -> Result<(), Con
 async fn read_handshake_response(
     transport: &mut AnyTransport,
     config: &ConnectionConfig,
+    handshake_id: u64,
 ) -> Result<Negotiated, ConnectError> {
     let buffer_cap = config.local_maximum_frame_size_value().min(MAX_FRAME_SIZE);
     let mut buffer: Vec<u8> = Vec::new();
@@ -576,7 +784,7 @@ async fn read_handshake_response(
             role: Role::Client,
             state: protocol::ConnectionState::PreNegotiation,
             limits: Limits::PRE_NEGOTIATION,
-            in_flight: &[HANDSHAKE_REQUEST_ID],
+            in_flight: std::slice::from_ref(&handshake_id),
         };
         match protocol::decode(&buffer, admission) {
             Step::Frame(frame) => return interpret_response(&frame, config),
@@ -723,7 +931,7 @@ mod tests {
     async fn close_moves_a_usable_connection_to_closed() -> Result<(), Box<dyn std::error::Error>> {
         let config = ConnectionConfig::new("in-memory");
         let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
-        let mut connection = Connection::establish(transport, &config).await?;
+        let connection = Connection::establish(transport, &config).await?;
         assert_eq!(connection.state(), ConnectionState::Usable);
         connection.close().await?;
         assert_eq!(connection.state(), ConnectionState::Closed);
@@ -736,7 +944,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let config = ConnectionConfig::new("in-memory");
         let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
-        let mut connection = Connection::establish(transport, &config).await?;
+        let connection = Connection::establish(transport, &config).await?;
         connection.close().await?;
         connection.close().await?;
         assert_eq!(connection.state(), ConnectionState::Closed);
@@ -750,7 +958,7 @@ mod tests {
         let inbound = response_frame(0, 65_536, 4_096, &[]);
         let transport =
             AnyTransport::Memory(InMemoryTransport::new(&inbound, 4_096, 4_096).fail_on_shutdown());
-        let mut connection = Connection::establish(transport, &config).await?;
+        let connection = Connection::establish(transport, &config).await?;
         assert!(connection.close().await.is_err());
         assert_eq!(connection.state(), ConnectionState::Failed);
         assert!(!connection.is_usable());
@@ -806,7 +1014,7 @@ mod tests {
     #[test]
     fn the_first_frame_is_the_handshake_request() -> Result<(), Box<dyn std::error::Error>> {
         let config = ConnectionConfig::new("127.0.0.1:6379");
-        let frame = build_handshake_request(&config)?;
+        let frame = build_handshake_request(&config, HANDSHAKE_REQUEST_ID)?;
         assert_eq!(frame.first().copied(), Some(0), "version");
         assert_eq!(frame.get(1).copied(), Some(1), "REQUEST");
         assert_eq!(
@@ -955,6 +1163,201 @@ mod tests {
             }
             AnyTransport::Tcp(_) => return Err("expected the in-memory transport".into()),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn an_in_flight_bound_below_one_is_refused() {
+        let config = ConnectionConfig::new("127.0.0.1:6379").maximum_in_flight(0);
+        assert_eq!(
+            config.validate(),
+            Err(ConnectionConfigError::InFlightBoundBelowMinimum { proposed: 0 })
+        );
+    }
+
+    #[test]
+    fn the_default_in_flight_bound_is_sixty_four() {
+        let config = ConnectionConfig::new("127.0.0.1:6379");
+        assert_eq!(config.maximum_in_flight_value(), 64);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn clones_share_one_session() -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        let peer = connection.clone();
+        assert_eq!(peer.protocol_version(), connection.protocol_version());
+        assert_eq!(peer.maximum_in_flight(), 64);
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        assert_eq!(peer.state(), ConnectionState::Closed);
+        assert!(!peer.is_usable());
+        peer.close().await?;
+        assert_eq!(peer.state(), ConnectionState::Closed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_tasks_use_clones_without_an_exclusive_borrow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        let first = connection.clone();
+        let second = connection.clone();
+        let (version, maximum, usable) = tokio::join!(
+            async { first.protocol_version() },
+            async { second.maximum_frame_size() },
+            async { connection.is_usable() },
+        );
+        assert_eq!(version, 0);
+        assert_eq!(maximum, 65_536);
+        assert!(usable);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admission_waits_at_the_bound_and_close_wakes_waiters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory").maximum_in_flight(2);
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        assert_eq!(connection.maximum_in_flight(), 2);
+        assert_eq!(connection.admission_permits_for_test(), 2);
+        let first = connection.acquire_admission_for_test().await?;
+        let second = connection.acquire_admission_for_test().await?;
+        assert_eq!(connection.admission_permits_for_test(), 0);
+        let waiter = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.acquire_admission_for_test().await.is_err() }
+        });
+        tokio::task::yield_now().await;
+        connection.close().await?;
+        assert!(waiter.await.unwrap_or(false));
+        drop(first);
+        drop(second);
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bound_of_one_serializes_without_deadlock() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let config = ConnectionConfig::new("in-memory").maximum_in_flight(1);
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        assert_eq!(connection.admission_permits_for_test(), 1);
+        let held = connection.acquire_admission_for_test().await?;
+        assert_eq!(connection.admission_permits_for_test(), 0);
+        let waiter = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.acquire_admission_for_test().await.is_ok() }
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+        assert!(waiter.await.unwrap_or(false));
+        assert_eq!(connection.admission_permits_for_test(), 1);
+        connection.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permits_return_to_baseline_after_release() -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory").maximum_in_flight(3);
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        let first = connection.acquire_admission_for_test().await?;
+        let second = connection.acquire_admission_for_test().await?;
+        assert_eq!(connection.admission_permits_for_test(), 1);
+        drop(first);
+        drop(second);
+        assert_eq!(connection.admission_permits_for_test(), 3);
+        connection.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_with_no_requests_is_orderly_and_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        assert_eq!(connection.admission_permits_for_test(), 64);
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        assert!(!connection.is_usable());
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_close_leaves_no_waiter_and_stays_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory").maximum_in_flight(1);
+        let inbound = response_frame(0, 65_536, 4_096, &[]);
+        let transport =
+            AnyTransport::Memory(InMemoryTransport::new(&inbound, 4_096, 4_096).fail_on_shutdown());
+        let connection = Connection::establish(transport, &config).await?;
+        let held = connection.acquire_admission_for_test().await?;
+        let waiter = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.acquire_admission_for_test().await.is_err() }
+        });
+        tokio::task::yield_now().await;
+        assert!(connection.close().await.is_err());
+        assert_eq!(connection.state(), ConnectionState::Failed);
+        assert!(waiter.await.unwrap_or(false));
+        drop(held);
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Failed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_fatal_dispatch_lands_unusable_and_wakes_every_waiter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory").maximum_in_flight(1);
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        let held = connection.acquire_admission_for_test().await?;
+        let waiter = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.acquire_admission_for_test().await.is_err() }
+        });
+        tokio::task::yield_now().await;
+        connection.mark_unusable_for_test();
+        assert_eq!(connection.state(), ConnectionState::Unusable);
+        assert!(!connection.is_usable());
+        assert!(waiter.await.unwrap_or(false));
+        drop(held);
+        assert!(connection.acquire_admission_for_test().await.is_err());
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Unusable);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_cycles_leave_no_residue() -> Result<(), Box<dyn std::error::Error>> {
+        for _ in [0, 1, 2] {
+            let config = ConnectionConfig::new("in-memory").maximum_in_flight(2);
+            let inbound = response_frame(0, 65_536, 4_096, &[]);
+            let transport = AnyTransport::Memory(
+                InMemoryTransport::new(&inbound, 4_096, 4_096).fail_on_shutdown(),
+            );
+            let connection = Connection::establish(transport, &config).await?;
+            assert_eq!(connection.admission_permits_for_test(), 2);
+            assert!(connection.close().await.is_err());
+            assert_eq!(connection.state(), ConnectionState::Failed);
+        }
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        assert_eq!(connection.state(), ConnectionState::Usable);
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
         Ok(())
     }
 }

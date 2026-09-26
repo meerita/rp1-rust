@@ -9,6 +9,34 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Multiplexed request lifecycle on one connection: monotonic initiator
+  identifiers from 1 with 0 skipped on wrap, a live registry that
+  refuses 0 and live reuse and retires each identifier once, and
+  correlation by ID in any arrival order with interleaved completion.
+  One driver owns the transport in both directions and dispatches
+  terminal frames into per-request completions. Unknown or duplicate
+  terminal frames end the session as unusable and resolve every
+  in-flight request. An abandoned waiter keeps its identifier live until
+  its terminal retires it.
+- Bounded admission with a `maximum_in_flight` configuration knob,
+  default 64 and minimum 1, validated before any connection. A full
+  connection waits while usable; failure or shutdown wakes every waiter.
+  Bookkeeping stays proportional to the bound and returns to baseline on
+  retire. A bound of 1 serializes without deadlock.
+- Shared session handles: `Connection` is `Clone`, and a clone is
+  another handle to the same session, never a new connection. Concurrent
+  tasks use clones without an exclusive borrow. Close stops admission,
+  resolves in-flight work, shuts the transport, and lands in closed,
+  failed, or unusable as each path requires. Terminal states are sticky;
+  closing an already terminal connection succeeds without touching the
+  transport.
+- Multiplexing conformance: deterministic duplex-peer permutation,
+  admission, reuse, exhaustion, shutdown, and concurrency coverage, plus
+  stable `B.multiplex.*` scenarios stating caller and state outcomes for
+  ordered, reverse, permuted, fragmented, unknown-ID fatal,
+  duplicate-terminal fatal, abandonment, peer close with open requests,
+  bound exposure, shared clones, concurrent clones, and idempotent
+  close.
 - A public `ConnectionState` with the `Usable`, `Closing`, `Closed`,
   `Failed`, and `Unusable` lifecycle states. Usable and closing occupy the
   negotiated protocol state; closed, failed, and unusable occupy the

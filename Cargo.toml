@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 publish = false
 license = "MIT OR Apache-2.0"
-description = "Official Rust client for RP-1. Early development: this version exposes a low-level protocol module and a connection surface, and no command."
+description = "Official Rust client for RP-1. Early development: this version exposes a low-level protocol module, a connection surface with multiplexed request identity and bounded admission, and no command."
 repository = "https://github.com/meerita/rp1-rust"
 documentation = "https://docs.rs/rp1db"
 readme = "README.md"
@@ -24,7 +24,7 @@ include = [
 ]
 
 [dependencies]
-tokio = { version = "1", default-features = false, features = ["net", "io-util"] }
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "rt", "sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
