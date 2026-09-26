@@ -2,8 +2,8 @@
 //!
 //! A connection becomes usable only after the handshake completes. This
 //! module owns the public configuration, the connect path, the handshake
-//! exchange as untrusted input, and the negotiated session state the
-//! connection exposes.
+//! exchange as untrusted input, the negotiated session state the
+//! connection exposes, and the explicit lifecycle state of the connection.
 //!
 //! It owns no command surface. A connection negotiates and closes; it runs
 //! no operation.
@@ -11,9 +11,10 @@
 use std::fmt;
 
 use crate::protocol::{
-    self, Admission, CapabilityEntries, ConnectionState, ErrorClass, Failure, HANDSHAKE_OPCODE,
-    HandshakeOffer, HandshakeRequest, HandshakeResponse, Kind, Limits, MAX_FRAME_SIZE,
-    MINIMUM_NEGOTIATED_FRAME_SIZE, Outgoing, OutgoingPayload, Payload, Role, Step,
+    self, Admission, CapabilityEntries, ErrorClass, Failure, HANDSHAKE_OPCODE, HandshakeOffer,
+    HandshakeRequest, HandshakeResponse, Kind, Limits, MAX_FRAME_SIZE,
+    MINIMUM_NEGOTIATED_FRAME_SIZE, MINIMUM_NEGOTIATED_METADATA_SIZE, Outgoing, OutgoingPayload,
+    Payload, Role, Step,
 };
 use crate::transport::{AnyTransport, TokioTransport};
 
@@ -33,6 +34,12 @@ const OFFER: HandshakeOffer<'_> = HandshakeOffer {
 /// The desired maximum frame size a configuration proposes by default.
 const DEFAULT_DESIRED_MAXIMUM_FRAME_SIZE: u32 = 65_536;
 
+/// The default local cap on the negotiated maximum frame size.
+const DEFAULT_LOCAL_MAXIMUM_FRAME_SIZE: u64 = MINIMUM_NEGOTIATED_FRAME_SIZE;
+
+/// The default local cap on the negotiated maximum metadata size.
+const DEFAULT_LOCAL_MAXIMUM_METADATA_SIZE: u16 = MINIMUM_NEGOTIATED_METADATA_SIZE;
+
 /// A failure a connection configuration can describe before any connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -43,6 +50,16 @@ pub enum ConnectionConfigError {
     FrameSizeBelowFloor {
         /// The proposed value.
         proposed: u32,
+    },
+    /// The local maximum frame size lies below the protocol floor.
+    LocalFrameSizeBelowFloor {
+        /// The proposed value.
+        proposed: u64,
+    },
+    /// The local maximum metadata size lies below the protocol floor.
+    LocalMetadataSizeBelowFloor {
+        /// The proposed value.
+        proposed: u16,
     },
 }
 
@@ -56,6 +73,18 @@ impl fmt::Display for ConnectionConfigError {
                     "the desired maximum frame size {proposed} is below the floor 65536"
                 )
             }
+            Self::LocalFrameSizeBelowFloor { proposed } => {
+                write!(
+                    formatter,
+                    "the local maximum frame size {proposed} is below the floor 65536"
+                )
+            }
+            Self::LocalMetadataSizeBelowFloor { proposed } => {
+                write!(
+                    formatter,
+                    "the local maximum metadata size {proposed} is below the floor 4096"
+                )
+            }
         }
     }
 }
@@ -63,10 +92,20 @@ impl fmt::Display for ConnectionConfigError {
 impl std::error::Error for ConnectionConfigError {}
 
 /// The typed configuration a connection is opened from.
+///
+/// The desired maximum frame size is the proposal the handshake carries;
+/// the negotiated value derives from it and the responder ceiling. The
+/// local maximum frame and metadata sizes are this client's own caps: a
+/// handshake that negotiates above either is refused locally and the
+/// connection never becomes usable. The local caps never raise a
+/// negotiated bound; the effective bound in force is the stricter of the
+/// two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionConfig {
     endpoint: String,
     desired_maximum_frame_size: u32,
+    local_maximum_frame_size: u64,
+    local_maximum_metadata_size: u16,
 }
 
 impl ConnectionConfig {
@@ -76,13 +115,33 @@ impl ConnectionConfig {
         Self {
             endpoint: endpoint.into(),
             desired_maximum_frame_size: DEFAULT_DESIRED_MAXIMUM_FRAME_SIZE,
+            local_maximum_frame_size: DEFAULT_LOCAL_MAXIMUM_FRAME_SIZE,
+            local_maximum_metadata_size: DEFAULT_LOCAL_MAXIMUM_METADATA_SIZE,
         }
     }
 
     /// Sets the desired maximum frame size the handshake proposes.
+    ///
+    /// A proposal above the local maximum frame size risks a local refusal:
+    /// when the negotiated value exceeds the local cap the handshake fails
+    /// and no connection is returned.
     #[must_use]
     pub const fn desired_maximum_frame_size(mut self, value: u32) -> Self {
         self.desired_maximum_frame_size = value;
+        self
+    }
+
+    /// Sets the local cap on the negotiated maximum frame size.
+    #[must_use]
+    pub const fn local_maximum_frame_size(mut self, value: u64) -> Self {
+        self.local_maximum_frame_size = value;
+        self
+    }
+
+    /// Sets the local cap on the negotiated maximum metadata size.
+    #[must_use]
+    pub const fn local_maximum_metadata_size(mut self, value: u16) -> Self {
+        self.local_maximum_metadata_size = value;
         self
     }
 
@@ -98,10 +157,16 @@ impl ConnectionConfig {
         self.desired_maximum_frame_size
     }
 
-    /// Returns the local maximum metadata size in force.
+    /// Returns the local cap on the negotiated maximum frame size.
     #[must_use]
-    pub const fn maximum_metadata_size(&self) -> u16 {
-        protocol::MAX_METADATA_SIZE
+    pub const fn local_maximum_frame_size_value(&self) -> u64 {
+        self.local_maximum_frame_size
+    }
+
+    /// Returns the local cap on the negotiated maximum metadata size.
+    #[must_use]
+    pub const fn local_maximum_metadata_size_value(&self) -> u16 {
+        self.local_maximum_metadata_size
     }
 
     /// Validates the configuration before any connection is opened.
@@ -109,8 +174,9 @@ impl ConnectionConfig {
     /// # Errors
     ///
     /// Returns [`ConnectionConfigError::EmptyEndpoint`] when the endpoint is
-    /// empty and [`ConnectionConfigError::FrameSizeBelowFloor`] when the
-    /// desired maximum frame size lies below the protocol floor.
+    /// empty, [`ConnectionConfigError::FrameSizeBelowFloor`] when the
+    /// desired maximum frame size lies below the protocol floor, and the
+    /// local variants when a local cap lies below its protocol floor.
     pub fn validate(&self) -> Result<(), ConnectionConfigError> {
         if self.endpoint.trim().is_empty() {
             return Err(ConnectionConfigError::EmptyEndpoint);
@@ -118,6 +184,16 @@ impl ConnectionConfig {
         if u64::from(self.desired_maximum_frame_size) < MINIMUM_NEGOTIATED_FRAME_SIZE {
             return Err(ConnectionConfigError::FrameSizeBelowFloor {
                 proposed: self.desired_maximum_frame_size,
+            });
+        }
+        if self.local_maximum_frame_size < MINIMUM_NEGOTIATED_FRAME_SIZE {
+            return Err(ConnectionConfigError::LocalFrameSizeBelowFloor {
+                proposed: self.local_maximum_frame_size,
+            });
+        }
+        if self.local_maximum_metadata_size < MINIMUM_NEGOTIATED_METADATA_SIZE {
+            return Err(ConnectionConfigError::LocalMetadataSizeBelowFloor {
+                proposed: self.local_maximum_metadata_size,
             });
         }
         Ok(())
@@ -142,6 +218,22 @@ pub enum ConnectError {
     HandshakeFailure(Failure),
     /// The peer closed the transport before the handshake completed.
     ClosedDuringHandshake,
+    /// The negotiated maximum frame size exceeded the local cap, so the
+    /// handshake was refused locally and no connection was returned.
+    NegotiatedFrameSizeAboveLocal {
+        /// The value the handshake response stated.
+        negotiated: u64,
+        /// The local cap the configuration states.
+        local: u64,
+    },
+    /// The negotiated maximum metadata size exceeded the local cap, so the
+    /// handshake was refused locally and no connection was returned.
+    NegotiatedMetadataSizeAboveLocal {
+        /// The value the handshake response stated.
+        negotiated: u16,
+        /// The local cap the configuration states.
+        local: u16,
+    },
     /// The peer sent a frame that is not the handshake response.
     UnexpectedFrame,
 }
@@ -159,6 +251,18 @@ impl fmt::Display for ConnectError {
             Self::ClosedDuringHandshake => {
                 formatter.write_str("the peer closed during the handshake")
             }
+            Self::NegotiatedFrameSizeAboveLocal { negotiated, local } => {
+                write!(
+                    formatter,
+                    "the negotiated maximum frame size {negotiated} exceeds the local cap {local}"
+                )
+            }
+            Self::NegotiatedMetadataSizeAboveLocal { negotiated, local } => {
+                write!(
+                    formatter,
+                    "the negotiated maximum metadata size {negotiated} exceeds the local cap {local}"
+                )
+            }
             Self::UnexpectedFrame => formatter.write_str("the peer sent an unexpected frame"),
         }
     }
@@ -169,7 +273,11 @@ impl std::error::Error for ConnectError {
         match self {
             Self::InvalidConfiguration(error) => Some(error),
             Self::Transport(error) => Some(error),
-            Self::HandshakeFailure(_) | Self::ClosedDuringHandshake | Self::UnexpectedFrame => None,
+            Self::HandshakeFailure(_)
+            | Self::ClosedDuringHandshake
+            | Self::NegotiatedFrameSizeAboveLocal { .. }
+            | Self::NegotiatedMetadataSizeAboveLocal { .. }
+            | Self::UnexpectedFrame => None,
         }
     }
 }
@@ -181,15 +289,56 @@ struct Negotiated {
     maximum_frame_size: u64,
     maximum_metadata_size: u16,
     accepted_capabilities: Vec<u16>,
+    local_maximum_frame_size: u64,
+    local_maximum_metadata_size: u16,
 }
 
 /// The lifecycle state of a connection.
+///
+/// A connection is usable only after the handshake completes. Closing runs
+/// while an explicit shutdown is in progress. Closed, failed, and unusable
+/// are terminal: a connection that reaches one never becomes usable again.
+///
+/// The states map onto the protocol connection states as follows: usable
+/// and closing are the negotiated state, and closed, failed, and unusable
+/// are the terminal state. The three terminal states keep why the session
+/// ended: closed after an orderly shutdown, failed after a transport
+/// failure, unusable after a failure that made continued protocol
+/// operation unsafe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lifecycle {
-    /// The handshake completed and the connection is usable.
-    Negotiated,
-    /// The connection was closed.
+#[non_exhaustive]
+pub enum ConnectionState {
+    /// The handshake completed and the connection accepts no new work yet
+    /// runs no command; it is open and has not entered shutdown or failure.
+    Usable,
+    /// An explicit shutdown started and the transport close is pending.
+    Closing,
+    /// An orderly shutdown completed.
     Closed,
+    /// The transport failed.
+    Failed,
+    /// Continued protocol operation became unsafe. The establishment path
+    /// reports such a failure through [`ConnectError`] and returns no
+    /// connection, so this state is first reached by failures detected
+    /// after establishment.
+    Unusable,
+}
+
+impl ConnectionState {
+    /// Returns the protocol connection state this lifecycle state occupies.
+    #[must_use]
+    pub const fn protocol_state(self) -> protocol::ConnectionState {
+        match self {
+            Self::Usable | Self::Closing => protocol::ConnectionState::Negotiated,
+            Self::Closed | Self::Failed | Self::Unusable => protocol::ConnectionState::Terminal,
+        }
+    }
+
+    /// Returns whether the connection is usable.
+    #[must_use]
+    pub const fn is_usable(self) -> bool {
+        matches!(self, Self::Usable)
+    }
 }
 
 /// A usable protocol version 0 connection.
@@ -197,11 +346,16 @@ enum Lifecycle {
 /// A `Connection` is returned only after the handshake completes. It owns
 /// its transport and its negotiated session state. It exposes no command;
 /// a later revision adds the command surface.
+///
+/// Dropping a `Connection` without calling [`Connection::close`] closes
+/// the transport without waiting and releases local resources. It sends
+/// no protocol exchange and rolls nothing back. Callers that need a
+/// deterministic shutdown call `close`.
 #[derive(Debug)]
 pub struct Connection {
     transport: AnyTransport,
     negotiated: Negotiated,
-    lifecycle: Lifecycle,
+    state: ConnectionState,
 }
 
 impl Connection {
@@ -213,9 +367,11 @@ impl Connection {
     /// Returns [`ConnectError::InvalidConfiguration`] when the configuration
     /// is invalid, [`ConnectError::Transport`] when the transport fails,
     /// [`ConnectError::ClosedDuringHandshake`] when the peer closes before
-    /// the handshake completes, and [`ConnectError::HandshakeFailure`] or
-    /// [`ConnectError::UnexpectedFrame`] when the peer's response is not a
-    /// valid handshake response.
+    /// the handshake completes, [`ConnectError::NegotiatedFrameSizeAboveLocal`]
+    /// or [`ConnectError::NegotiatedMetadataSizeAboveLocal`] when the
+    /// negotiated bound exceeds the local cap, and
+    /// [`ConnectError::HandshakeFailure`] or [`ConnectError::UnexpectedFrame`]
+    /// when the peer's response is not a valid handshake response.
     pub async fn connect(config: &ConnectionConfig) -> Result<Self, ConnectError> {
         config
             .validate()
@@ -233,11 +389,25 @@ impl Connection {
     ) -> Result<Self, ConnectError> {
         let frame = build_handshake_request(config)?;
         write_all(&mut transport, &frame).await?;
-        let negotiated = read_handshake_response(&mut transport).await?;
+        let negotiated = read_handshake_response(&mut transport, config).await?;
+        if negotiated.maximum_frame_size > config.local_maximum_frame_size_value() {
+            let _ = transport.shutdown().await;
+            return Err(ConnectError::NegotiatedFrameSizeAboveLocal {
+                negotiated: negotiated.maximum_frame_size,
+                local: config.local_maximum_frame_size_value(),
+            });
+        }
+        if negotiated.maximum_metadata_size > config.local_maximum_metadata_size_value() {
+            let _ = transport.shutdown().await;
+            return Err(ConnectError::NegotiatedMetadataSizeAboveLocal {
+                negotiated: negotiated.maximum_metadata_size,
+                local: config.local_maximum_metadata_size_value(),
+            });
+        }
         Ok(Self {
             transport,
             negotiated,
-            lifecycle: Lifecycle::Negotiated,
+            state: ConnectionState::Usable,
         })
     }
 
@@ -259,26 +429,90 @@ impl Connection {
         self.negotiated.maximum_metadata_size
     }
 
+    /// Returns the local cap on the negotiated maximum frame size.
+    #[must_use]
+    pub const fn local_maximum_frame_size(&self) -> u64 {
+        self.negotiated.local_maximum_frame_size
+    }
+
+    /// Returns the local cap on the negotiated maximum metadata size.
+    #[must_use]
+    pub const fn local_maximum_metadata_size(&self) -> u16 {
+        self.negotiated.local_maximum_metadata_size
+    }
+
+    /// Returns the effective maximum frame size: the stricter of the
+    /// negotiated bound and the local cap.
+    ///
+    /// Establishment refuses a handshake that negotiates above the local
+    /// cap, so on a usable connection the effective bound equals the
+    /// negotiated one. Later request admission reads this bound rather
+    /// than the negotiated value alone.
+    #[must_use]
+    pub const fn effective_maximum_frame_size(&self) -> u64 {
+        if self.negotiated.maximum_frame_size < self.negotiated.local_maximum_frame_size {
+            self.negotiated.maximum_frame_size
+        } else {
+            self.negotiated.local_maximum_frame_size
+        }
+    }
+
+    /// Returns the effective maximum metadata size: the stricter of the
+    /// negotiated bound and the local cap.
+    #[must_use]
+    pub const fn effective_maximum_metadata_size(&self) -> u16 {
+        if self.negotiated.maximum_metadata_size < self.negotiated.local_maximum_metadata_size {
+            self.negotiated.maximum_metadata_size
+        } else {
+            self.negotiated.local_maximum_metadata_size
+        }
+    }
+
     /// Returns the accepted capability identifiers.
     #[must_use]
     pub fn accepted_capabilities(&self) -> &[u16] {
         &self.negotiated.accepted_capabilities
     }
 
+    /// Returns the lifecycle state of the connection.
+    #[must_use]
+    pub const fn state(&self) -> ConnectionState {
+        self.state
+    }
+
     /// Returns whether the connection is usable. This is false after close.
     #[must_use]
     pub const fn is_usable(&self) -> bool {
-        matches!(self.lifecycle, Lifecycle::Negotiated)
+        self.state.is_usable()
     }
 
     /// Closes the connection.
     ///
+    /// Closing stops admission, shuts the transport down, and moves the
+    /// connection to [`ConnectionState::Closed`]. When the transport
+    /// shutdown fails, the connection moves to [`ConnectionState::Failed`]
+    /// instead and the error is returned. Closing an already closed
+    /// connection succeeds without touching the transport.
+    ///
     /// # Errors
     ///
-    /// Returns the underlying transport error.
-    pub async fn close(mut self) -> Result<(), std::io::Error> {
-        self.lifecycle = Lifecycle::Closed;
-        self.transport.shutdown().await
+    /// Returns the underlying transport error, leaving the connection in
+    /// the failed state.
+    pub async fn close(&mut self) -> Result<(), std::io::Error> {
+        if self.state == ConnectionState::Closed {
+            return Ok(());
+        }
+        self.state = ConnectionState::Closing;
+        match self.transport.shutdown().await {
+            Ok(()) => {
+                self.state = ConnectionState::Closed;
+                Ok(())
+            }
+            Err(error) => {
+                self.state = ConnectionState::Failed;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -328,21 +562,28 @@ async fn write_all(transport: &mut AnyTransport, bytes: &[u8]) -> Result<(), Con
 }
 
 /// Reads frames until the handshake response arrives and owns its values.
-async fn read_handshake_response(transport: &mut AnyTransport) -> Result<Negotiated, ConnectError> {
+///
+/// The read buffer grows only with bytes actually received and never past
+/// the stricter of the pre-negotiation protocol bound and the local cap.
+async fn read_handshake_response(
+    transport: &mut AnyTransport,
+    config: &ConnectionConfig,
+) -> Result<Negotiated, ConnectError> {
+    let buffer_cap = config.local_maximum_frame_size_value().min(MAX_FRAME_SIZE);
     let mut buffer: Vec<u8> = Vec::new();
     loop {
         let admission = Admission {
             role: Role::Client,
-            state: ConnectionState::PreNegotiation,
+            state: protocol::ConnectionState::PreNegotiation,
             limits: Limits::PRE_NEGOTIATION,
             in_flight: &[HANDSHAKE_REQUEST_ID],
         };
         match protocol::decode(&buffer, admission) {
-            Step::Frame(frame) => return interpret_response(&frame),
+            Step::Frame(frame) => return interpret_response(&frame, config),
             Step::Failure { failure, .. } => return Err(ConnectError::HandshakeFailure(failure)),
             Step::Need(required) => {
-                let bound = usize::try_from(MAX_FRAME_SIZE).unwrap_or(usize::MAX);
-                if required > bound {
+                let bound = usize::try_from(buffer_cap).unwrap_or(usize::MAX);
+                if required > bound || buffer.len() >= bound {
                     return Err(ConnectError::HandshakeFailure(Failure::resource_limit()));
                 }
                 let mut chunk = [0u8; READ_CHUNK];
@@ -361,7 +602,10 @@ async fn read_handshake_response(transport: &mut AnyTransport) -> Result<Negotia
 }
 
 /// Interprets the admitted terminal frame of the handshake.
-fn interpret_response(frame: &protocol::Frame<'_>) -> Result<Negotiated, ConnectError> {
+fn interpret_response(
+    frame: &protocol::Frame<'_>,
+    config: &ConnectionConfig,
+) -> Result<Negotiated, ConnectError> {
     let header = frame.header();
     match header.kind() {
         Kind::Response if header.code() == 0 => {
@@ -380,6 +624,8 @@ fn interpret_response(frame: &protocol::Frame<'_>) -> Result<Negotiated, Connect
                     .iter()
                     .map(|entry| entry.identifier())
                     .collect(),
+                local_maximum_frame_size: config.local_maximum_frame_size_value(),
+                local_maximum_metadata_size: config.local_maximum_metadata_size_value(),
             })
         }
         Kind::Error => {
@@ -444,6 +690,74 @@ mod tests {
     }
 
     #[test]
+    fn the_lifecycle_states_map_onto_the_protocol_states() {
+        use crate::protocol::ConnectionState as ProtocolState;
+        assert_eq!(
+            ConnectionState::Usable.protocol_state(),
+            ProtocolState::Negotiated
+        );
+        assert_eq!(
+            ConnectionState::Closing.protocol_state(),
+            ProtocolState::Negotiated
+        );
+        assert_eq!(
+            ConnectionState::Closed.protocol_state(),
+            ProtocolState::Terminal
+        );
+        assert_eq!(
+            ConnectionState::Failed.protocol_state(),
+            ProtocolState::Terminal
+        );
+        assert_eq!(
+            ConnectionState::Unusable.protocol_state(),
+            ProtocolState::Terminal
+        );
+        assert!(ConnectionState::Usable.is_usable());
+        assert!(!ConnectionState::Closing.is_usable());
+        assert!(!ConnectionState::Closed.is_usable());
+        assert!(!ConnectionState::Failed.is_usable());
+        assert!(!ConnectionState::Unusable.is_usable());
+    }
+
+    #[tokio::test]
+    async fn close_moves_a_usable_connection_to_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let mut connection = Connection::establish(transport, &config).await?;
+        assert_eq!(connection.state(), ConnectionState::Usable);
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        assert!(!connection.is_usable());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_close_succeeds_without_touching_the_transport()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 4_096, &[]), 4_096, 4_096);
+        let mut connection = Connection::establish(transport, &config).await?;
+        connection.close().await?;
+        connection.close().await?;
+        assert_eq!(connection.state(), ConnectionState::Closed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_shutdown_moves_the_connection_to_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let inbound = response_frame(0, 65_536, 4_096, &[]);
+        let transport =
+            AnyTransport::Memory(InMemoryTransport::new(&inbound, 4_096, 4_096).fail_on_shutdown());
+        let mut connection = Connection::establish(transport, &config).await?;
+        assert!(connection.close().await.is_err());
+        assert_eq!(connection.state(), ConnectionState::Failed);
+        assert!(!connection.is_usable());
+        Ok(())
+    }
+
+    #[test]
     fn an_empty_endpoint_is_refused() {
         let config = ConnectionConfig::new("   ");
         assert_eq!(config.validate(), Err(ConnectionConfigError::EmptyEndpoint));
@@ -456,6 +770,32 @@ mod tests {
             config.validate(),
             Err(ConnectionConfigError::FrameSizeBelowFloor { proposed: 1_000 })
         );
+    }
+
+    #[test]
+    fn a_local_frame_size_below_the_floor_is_refused() {
+        let config = ConnectionConfig::new("127.0.0.1:6379").local_maximum_frame_size(1_000);
+        assert_eq!(
+            config.validate(),
+            Err(ConnectionConfigError::LocalFrameSizeBelowFloor { proposed: 1_000 })
+        );
+    }
+
+    #[test]
+    fn a_local_metadata_size_below_the_floor_is_refused() {
+        let config = ConnectionConfig::new("127.0.0.1:6379").local_maximum_metadata_size(1_000);
+        assert_eq!(
+            config.validate(),
+            Err(ConnectionConfigError::LocalMetadataSizeBelowFloor { proposed: 1_000 })
+        );
+    }
+
+    #[test]
+    fn the_default_local_caps_are_the_protocol_floors() {
+        let config = ConnectionConfig::new("127.0.0.1:6379");
+        assert_eq!(config.local_maximum_frame_size_value(), 65_536);
+        assert_eq!(config.local_maximum_metadata_size_value(), 4_096);
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]
@@ -487,6 +827,7 @@ mod tests {
         assert_eq!(connection.maximum_frame_size(), 65_536);
         assert_eq!(connection.maximum_metadata_size(), 4_096);
         assert!(connection.accepted_capabilities().is_empty());
+        assert_eq!(connection.state(), ConnectionState::Usable);
         assert!(connection.is_usable());
         Ok(())
     }
@@ -540,6 +881,55 @@ mod tests {
                 assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
             }
             other => return Err(format!("expected a protocol violation, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_usable_connection_exposes_local_and_effective_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory")
+            .desired_maximum_frame_size(131_072)
+            .local_maximum_frame_size(131_072)
+            .local_maximum_metadata_size(8_192);
+        let transport = memory(&response_frame(0, 131_072, 8_192, &[]), 4_096, 4_096);
+        let connection = Connection::establish(transport, &config).await?;
+        assert_eq!(connection.maximum_frame_size(), 131_072);
+        assert_eq!(connection.maximum_metadata_size(), 8_192);
+        assert_eq!(connection.local_maximum_frame_size(), 131_072);
+        assert_eq!(connection.local_maximum_metadata_size(), 8_192);
+        assert_eq!(connection.effective_maximum_frame_size(), 131_072);
+        assert_eq!(connection.effective_maximum_metadata_size(), 8_192);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_negotiated_frame_size_above_the_local_cap_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory").desired_maximum_frame_size(131_072);
+        assert_eq!(config.local_maximum_frame_size_value(), 65_536);
+        let transport = memory(&response_frame(0, 131_072, 4_096, &[]), 4_096, 4_096);
+        match Connection::establish(transport, &config).await {
+            Err(ConnectError::NegotiatedFrameSizeAboveLocal { negotiated, local }) => {
+                assert_eq!(negotiated, 131_072);
+                assert_eq!(local, 65_536);
+            }
+            other => return Err(format!("expected a local refusal, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_negotiated_metadata_size_above_the_local_cap_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = ConnectionConfig::new("in-memory");
+        let transport = memory(&response_frame(0, 65_536, 8_192, &[]), 4_096, 4_096);
+        match Connection::establish(transport, &config).await {
+            Err(ConnectError::NegotiatedMetadataSizeAboveLocal { negotiated, local }) => {
+                assert_eq!(negotiated, 8_192);
+                assert_eq!(local, 4_096);
+            }
+            other => return Err(format!("expected a local refusal, got {other:?}").into()),
         }
         Ok(())
     }

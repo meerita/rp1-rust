@@ -23,7 +23,11 @@ implements the public RP-1 protocol specification, revision `v0.4.0`:
   the first frame, validates the response, and returns a connection only
   after negotiation completes. A usable connection exposes the negotiated
   protocol version, the negotiated frame and metadata bounds, and the
-  accepted capability set, and closes explicitly.
+  accepted capability set, and closes explicitly. The configuration also
+  carries local frame and metadata caps, independent of the negotiated
+  bounds: a handshake that negotiates above either cap is refused
+  locally, and a usable connection reports the effective bounds, the
+  stricter of the negotiated and local values.
 
 The crate exposes no command surface. Revision `v0.4.0` assigns no
 operation beyond the handshake, so a connection connects and runs no

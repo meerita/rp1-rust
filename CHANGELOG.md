@@ -9,6 +9,30 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A public `ConnectionState` with the `Usable`, `Closing`, `Closed`,
+  `Failed`, and `Unusable` lifecycle states. Usable and closing occupy the
+  negotiated protocol state; closed, failed, and unusable occupy the
+  terminal state. `Connection::state` reports the current state, and
+  `Connection::close` borrows the connection, moves it through closing to
+  closed on an orderly shutdown or to failed when the transport shutdown
+  fails, and succeeds without effect when the connection is already
+  closed. Dropping a connection without closing it closes the transport
+  without waiting and releases local resources.
+- Local resource limits independent of negotiation: `ConnectionConfig`
+  carries a local maximum frame size and a local maximum metadata size,
+  both defaulting to the protocol floors and validated before any
+  connection. A handshake that negotiates above either cap is refused
+  locally with a structured error and returns no connection. A usable
+  connection exposes the local caps and the effective bounds, the
+  stricter of the negotiated and local values, which later request
+  admission will read.
+- Connection establishment conformance: the integration suite drives the
+  connection against synthetic TCP peers across stable `B.*` scenarios
+  covering a valid exchange, version and bound negotiation, capability
+  refusal, frames outside the handshake, handshake order and uniqueness,
+  fragmentation, peer close, orderly shutdown, and local-limit refusal.
+  Every scenario states the caller-visible outcome and the
+  connection-state outcome.
 - A public `ConnectionConfig` and `Connection` with an asynchronous
   `connect` that opens a transport, sends the handshake request as the
   first frame, validates the response as untrusted input, and returns a
