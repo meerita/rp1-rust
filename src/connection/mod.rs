@@ -8,7 +8,11 @@
 //! It owns no command surface. A connection negotiates and closes; it runs
 //! no operation.
 
+mod dispatch;
+
 use std::fmt;
+
+use dispatch::{InFlightRegistry, RequestIdAllocator};
 
 use crate::protocol::{
     self, Admission, CapabilityEntries, ErrorClass, Failure, HANDSHAKE_OPCODE, HandshakeOffer,
@@ -387,9 +391,27 @@ impl Connection {
         mut transport: AnyTransport,
         config: &ConnectionConfig,
     ) -> Result<Self, ConnectError> {
-        let frame = build_handshake_request(config)?;
+        let mut allocator = RequestIdAllocator::new();
+        let mut in_flight = InFlightRegistry::new();
+        let handshake_id = allocator.allocate();
+        if handshake_id != HANDSHAKE_REQUEST_ID {
+            return Err(ConnectError::HandshakeFailure(Failure::protocol_violation()));
+        }
+        if in_flight.insert(handshake_id).is_err() {
+            return Err(ConnectError::HandshakeFailure(Failure::protocol_violation()));
+        }
+        let frame = build_handshake_request(config, handshake_id)?;
         write_all(&mut transport, &frame).await?;
-        let negotiated = read_handshake_response(&mut transport, config).await?;
+        let negotiated = read_handshake_response(&mut transport, config, handshake_id).await?;
+        let _ = in_flight.retire(handshake_id);
+        let live = in_flight.live_ids();
+        if in_flight.contains(handshake_id)
+            || !in_flight.is_empty()
+            || in_flight.len() != live.len()
+            || !live.is_empty()
+        {
+            return Err(ConnectError::HandshakeFailure(Failure::protocol_violation()));
+        }
         if negotiated.maximum_frame_size > config.local_maximum_frame_size_value() {
             let _ = transport.shutdown().await;
             return Err(ConnectError::NegotiatedFrameSizeAboveLocal {
@@ -517,7 +539,10 @@ impl Connection {
 }
 
 /// Builds the handshake request frame the offerer sends first.
-fn build_handshake_request(config: &ConnectionConfig) -> Result<Vec<u8>, ConnectError> {
+fn build_handshake_request(
+    config: &ConnectionConfig,
+    request_id: u64,
+) -> Result<Vec<u8>, ConnectError> {
     let request = HandshakeRequest::new(
         0,
         0,
@@ -528,7 +553,7 @@ fn build_handshake_request(config: &ConnectionConfig) -> Result<Vec<u8>, Connect
     let outgoing = Outgoing {
         kind: Kind::Request,
         code: HANDSHAKE_OPCODE,
-        request_id: HANDSHAKE_REQUEST_ID,
+        request_id,
         metadata: &[],
         payload: OutgoingPayload::Opaque(&payload),
     };
@@ -568,6 +593,7 @@ async fn write_all(transport: &mut AnyTransport, bytes: &[u8]) -> Result<(), Con
 async fn read_handshake_response(
     transport: &mut AnyTransport,
     config: &ConnectionConfig,
+    handshake_id: u64,
 ) -> Result<Negotiated, ConnectError> {
     let buffer_cap = config.local_maximum_frame_size_value().min(MAX_FRAME_SIZE);
     let mut buffer: Vec<u8> = Vec::new();
@@ -576,7 +602,7 @@ async fn read_handshake_response(
             role: Role::Client,
             state: protocol::ConnectionState::PreNegotiation,
             limits: Limits::PRE_NEGOTIATION,
-            in_flight: &[HANDSHAKE_REQUEST_ID],
+            in_flight: std::slice::from_ref(&handshake_id),
         };
         match protocol::decode(&buffer, admission) {
             Step::Frame(frame) => return interpret_response(&frame, config),
@@ -806,7 +832,7 @@ mod tests {
     #[test]
     fn the_first_frame_is_the_handshake_request() -> Result<(), Box<dyn std::error::Error>> {
         let config = ConnectionConfig::new("127.0.0.1:6379");
-        let frame = build_handshake_request(&config)?;
+        let frame = build_handshake_request(&config, HANDSHAKE_REQUEST_ID)?;
         assert_eq!(frame.first().copied(), Some(0), "version");
         assert_eq!(frame.get(1).copied(), Some(1), "REQUEST");
         assert_eq!(
