@@ -651,6 +651,24 @@ fn drain_bytes(buffer: &mut Vec<u8>, count: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    //! Multiplexing conformance, layer B, client-only.
+    //!
+    //! Each test drives the internal dispatcher against a deterministic
+    //! duplex peer and states both the caller-visible outcome and the
+    //! session-state outcome. The scenario identifiers are stable.
+    //!
+    //! ```text
+    //! B.multiplex.ordered-completion         submit_a_b_c_complete_a_b_c
+    //! B.multiplex.reverse-completion        submit_a_b_c_complete_c_b_a
+    //! B.multiplex.permuted-completion       submit_a_b_c_complete_b_c_a
+    //! B.multiplex.permuted-completion-2     submit_a_b_c_complete_b_a_c
+    //! B.multiplex.fragmented-completion     fragmented_responses_still_dispatch_by_id
+    //! B.multiplex.unknown-id-fatal          an_unknown_id_ends_the_session
+    //! B.multiplex.duplicate-terminal-fatal  a_duplicate_terminal_ends_the_session
+    //! B.multiplex.abandoned-waiter          an_abandoned_waiter_keeps_its_id_live_until_its_terminal
+    //! B.multiplex.peer-close-with-in-flight a_peer_close_with_open_requests_resolves_every_caller
+    //! B.multiplex.repeated-fatal-cycles     repeated_fatal_cycles_leave_no_residue
+    //! ```
     use super::{InFlightRegistry, RegistryError, RequestIdAllocator};
 
     #[test]

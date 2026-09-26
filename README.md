@@ -28,6 +28,21 @@ implements the public RP-1 protocol specification, revision `v0.4.0`:
   bounds: a handshake that negotiates above either cap is refused
   locally, and a usable connection reports the effective bounds, the
   stricter of the negotiated and local values.
+- Multiplexed request identity on one connection: monotonic initiator
+  identifiers from 1 with 0 skipped, a live registry that retires on the
+  terminal frame and releases once, and correlation by ID in any arrival
+  order with interleaved completion. One driver owns the transport in
+  both directions and dispatches terminal frames into per-request
+  completions; unknown or duplicate terminal frames end the session and
+  resolve every in-flight request.
+- Bounded admission with a `maximum_in_flight` configuration knob,
+  default 64 and minimum 1. A full connection waits while usable;
+  failure or shutdown wakes every waiter. Clones are additional handles
+  to the same session, never new connections, and concurrent tasks use
+  them without an exclusive borrow. Close stops admission, resolves
+  in-flight work from send-state evidence, shuts the transport, and
+  lands in closed, failed, or unusable as each path requires. Terminal
+  states are sticky.
 
 The crate exposes no command surface. Revision `v0.4.0` assigns no
 operation beyond the handshake, so a connection connects and runs no
