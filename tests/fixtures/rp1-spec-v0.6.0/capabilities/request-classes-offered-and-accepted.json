@@ -1,0 +1,32 @@
+{
+  "id": "capabilities/request-classes-offered-and-accepted",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Request Classes",
+  "direction": "encode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "fields": {
+      "version": 0,
+      "kind": 2,
+      "flags": 0,
+      "code": 0,
+      "request_id": "1",
+      "metadata": [],
+      "negotiated_protocol_version": 0,
+      "negotiated_maximum_frame_size": 65536,
+      "negotiated_maximum_metadata_size": 4096,
+      "capability_entries": [
+        {
+          "capability_id": 5,
+          "value": ""
+        }
+      ]
+    },
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "bytes": "00020000000000000e00000001000000000000000000000001000010010005000000"
+  }
+}

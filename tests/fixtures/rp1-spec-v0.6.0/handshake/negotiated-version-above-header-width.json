@@ -1,0 +1,18 @@
+{
+  "id": "handshake/negotiated-version-above-header-width",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Version Negotiation",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00020000000000000a000000010000000000000000010000010000100000",
+    "role": "client",
+    "state": "pre-negotiation"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "malformed request",
+    "scope": "connection-fatal"
+  }
+}

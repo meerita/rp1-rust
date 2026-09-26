@@ -1,0 +1,18 @@
+{
+  "id": "handshake/no-mutual-version",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Version Negotiation",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00010000010000000a000000010000000000000001000100000001000000",
+    "role": "server",
+    "state": "pre-negotiation"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "unsupported protocol version",
+    "scope": "connection-fatal"
+  }
+}

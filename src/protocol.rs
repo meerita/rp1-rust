@@ -1,15 +1,17 @@
 //! Low-level RP-1 protocol wire types and codec.
 //!
-//! This module owns the `rp1-spec` `v0.5.0` framing and codec contract: the
-//! validated header and metadata types, the handshake payload types, the
-//! failure classification, the incremental decoder, and the encoder.
+//! This module owns the `rp1-spec` `v0.6.0` framing and codec contract for
+//! the request lifetime subset: the validated header and metadata types,
+//! the handshake payload types, the failure classification including the
+//! deadline exceeded and cancelled classes, the withdrawal frame, the
+//! incremental decoder, and the encoder.
 //!
 //! It does not own transport, connection policy, request state, or any client
 //! API. `decode` and `encode` are pure functions over byte slices and
 //! validated values.
 
 /// The public specification revision this module implements.
-pub const SPEC_REVISION: &str = "v0.5.0";
+pub const SPEC_REVISION: &str = "v0.6.0";
 
 /// The fixed length of the frame header in bytes.
 pub const HEADER_LENGTH: usize = 20;
@@ -48,6 +50,18 @@ pub const MINIMUM_NEGOTIATED_METADATA_SIZE: u16 = 4_096;
 
 /// The highest value the one-byte header `version` field can carry.
 const HIGHEST_HEADER_VERSION: u16 = 255;
+
+/// The capability identifier that gates the withdrawal frame kind and the
+/// cancelled error class.
+pub const CANCELLATION_CAPABILITY_ID: u16 = 0x0002;
+
+/// The capability identifier that gates the deadline metadata entry and the
+/// deadline exceeded error class.
+pub const DEADLINES_CAPABILITY_ID: u16 = 0x0004;
+
+/// The metadata identifier of the optional deadline entry, carrying a
+/// little-endian `u32` count of microseconds.
+pub const DEADLINE_METADATA_ID: u16 = 0x0001;
 
 /// The state a connection occupies when it reads a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +102,13 @@ pub struct Admission<'a> {
     pub limits: Limits,
     /// The request ids in flight at the receiver.
     pub in_flight: &'a [u64],
+    /// The capability identifiers in the accepted set of the connection.
+    ///
+    /// Capability-gated wire behavior is admitted only when the accepted
+    /// set names its capability: the withdrawal frame needs cancellation,
+    /// and the deadline exceeded and cancelled classes need deadlines and
+    /// cancellation respectively. An empty set admits none of them.
+    pub capabilities: &'a [u16],
 }
 
 impl Default for Admission<'_> {
@@ -97,6 +118,7 @@ impl Default for Admission<'_> {
             state: ConnectionState::Negotiated,
             limits: Limits::PRE_NEGOTIATION,
             in_flight: &[],
+            capabilities: &[],
         }
     }
 }
@@ -139,6 +161,11 @@ pub enum Kind {
     Response,
     /// An error sent by the server.
     Error,
+    /// A withdrawal sent by the client, gated by the cancellation
+    /// capability. It names the request to withdraw, carries an empty
+    /// payload and an empty metadata region, and produces no frame of its
+    /// own.
+    Withdrawal,
 }
 
 impl Kind {
@@ -149,6 +176,7 @@ impl Kind {
             Self::Request => 1,
             Self::Response => 2,
             Self::Error => 3,
+            Self::Withdrawal => 7,
         }
     }
 
@@ -156,7 +184,7 @@ impl Kind {
     #[must_use]
     pub const fn sender(self) -> Role {
         match self {
-            Self::Request => Role::Client,
+            Self::Request | Self::Withdrawal => Role::Client,
             Self::Response | Self::Error => Role::Server,
         }
     }
@@ -168,6 +196,7 @@ impl Kind {
             1 => Some(Self::Request),
             2 => Some(Self::Response),
             3 => Some(Self::Error),
+            7 => Some(Self::Withdrawal),
             _ => None,
         }
     }
@@ -177,7 +206,7 @@ impl Kind {
     #[must_use]
     pub const fn names_a_request_for_scope(self, scope: FailureScope) -> bool {
         match self {
-            Self::Request | Self::Response => true,
+            Self::Request | Self::Response | Self::Withdrawal => true,
             Self::Error => matches!(scope, FailureScope::RequestScoped),
         }
     }
@@ -294,6 +323,14 @@ pub enum ErrorClass {
     InvalidArgument,
     /// A frame exceeds the maximum frame size in force.
     ResourceLimit,
+    /// The request carried a deadline whose duration had passed before the
+    /// responder began the work it names. Gated by the deadlines
+    /// capability; without it this class is treated as unassigned.
+    DeadlineExceeded,
+    /// The request was withdrawn before it committed. Gated by the
+    /// cancellation capability; without it this class is treated as
+    /// unassigned.
+    Cancelled,
     /// The receiver could not admit the resources the request needs.
     Overloaded,
     /// The receiver met a condition it did not anticipate.
@@ -315,6 +352,8 @@ impl ErrorClass {
             Self::UnsupportedOperation => 0x0003,
             Self::InvalidArgument => 0x0004,
             Self::ResourceLimit => 0x0005,
+            Self::DeadlineExceeded => 0x0006,
+            Self::Cancelled => 0x0007,
             Self::Overloaded => 0x0008,
             Self::InternalError => 0x000B,
             Self::ProtocolViolation => 0x000C,
@@ -332,6 +371,8 @@ impl ErrorClass {
             | Self::ProtocolViolation => FailureScope::ConnectionFatal,
             Self::UnsupportedOperation
             | Self::InvalidArgument
+            | Self::DeadlineExceeded
+            | Self::Cancelled
             | Self::Overloaded
             | Self::InternalError
             | Self::WrongType => FailureScope::RequestScoped,
@@ -347,6 +388,8 @@ impl ErrorClass {
             Self::UnsupportedOperation => "unsupported operation",
             Self::InvalidArgument => "invalid argument",
             Self::ResourceLimit => "resource limit",
+            Self::DeadlineExceeded => "deadline exceeded",
+            Self::Cancelled => "cancelled",
             Self::Overloaded => "overloaded",
             Self::InternalError => "internal error",
             Self::ProtocolViolation => "protocol violation",
@@ -363,6 +406,8 @@ impl ErrorClass {
             0x0003 => Some(Self::UnsupportedOperation),
             0x0004 => Some(Self::InvalidArgument),
             0x0005 => Some(Self::ResourceLimit),
+            0x0006 => Some(Self::DeadlineExceeded),
+            0x0007 => Some(Self::Cancelled),
             0x0008 => Some(Self::Overloaded),
             0x000B => Some(Self::InternalError),
             0x000C => Some(Self::ProtocolViolation),
@@ -787,6 +832,26 @@ impl<'a> HandshakeResponse<'a> {
     /// The fixed length of the response head in bytes.
     pub const HEAD_LENGTH: usize = 10;
 
+    /// Builds a handshake response from its parts, deriving the accepted
+    /// count from the entries.
+    #[must_use]
+    pub fn new(
+        negotiated_protocol_version: u16,
+        negotiated_maximum_frame_size: u32,
+        negotiated_maximum_metadata_size: u16,
+        accepted_capability_entries: CapabilityEntries<'a>,
+    ) -> Self {
+        let accepted_capability_count =
+            u16::try_from(accepted_capability_entries.count()).unwrap_or(u16::MAX);
+        Self {
+            negotiated_protocol_version,
+            negotiated_maximum_frame_size,
+            negotiated_maximum_metadata_size,
+            accepted_capability_count,
+            accepted_capability_entries,
+        }
+    }
+
     /// Decodes and validates a handshake response payload against the offer
     /// it answers, as untrusted input.
     ///
@@ -1092,7 +1157,12 @@ impl std::error::Error for EncodeError {}
 /// the receiver and is read by the correlation checks.
 #[must_use]
 pub fn decode<'a>(input: &'a [u8], admission: Admission<'_>) -> Step<'a> {
-    let admitted = match admit(input, admission.role, admission.limits) {
+    let admitted = match admit(
+        input,
+        admission.role,
+        admission.limits,
+        admission.capabilities,
+    ) {
         Ok(admitted) => admitted,
         Err(step) => return step,
     };
@@ -1102,7 +1172,13 @@ pub fn decode<'a>(input: &'a [u8], admission: Admission<'_>) -> Step<'a> {
     if let Err(failure) = check_connection_state(admission.state, kind, raw.code) {
         return step_for(failure, total_len, input.len());
     }
-    let correlation = match correlate(kind, raw.code, raw.request_id, admission.in_flight) {
+    let correlation = match correlate(
+        kind,
+        raw.code,
+        raw.request_id,
+        admission.in_flight,
+        admission.capabilities,
+    ) {
         Ok(correlation) => correlation,
         Err(failure) => return step_for(failure, total_len, input.len()),
     };
@@ -1145,7 +1221,12 @@ struct Admitted<'a> {
 
 /// Runs the frame admission checks from the header through the direction
 /// check, returning the frame's total length and parsed metadata region.
-fn admit(input: &[u8], role: Role, limits: Limits) -> Result<Admitted<'_>, Step<'_>> {
+fn admit<'a>(
+    input: &'a [u8],
+    role: Role,
+    limits: Limits,
+    capabilities: &[u16],
+) -> Result<Admitted<'a>, Step<'a>> {
     let Some(raw) = RawHeader::parse(input) else {
         return Err(Step::Need(HEADER_LENGTH));
     };
@@ -1212,7 +1293,19 @@ fn admit(input: &[u8], role: Role, limits: Limits) -> Result<Admitted<'_>, Step<
             consumed: input.len(),
         });
     };
+    if kind == Kind::Withdrawal && (raw.metadata_length != 0 || raw.payload_length != 0) {
+        return Err(Step::Failure {
+            failure: Failure::malformed_request(),
+            consumed: input.len(),
+        });
+    }
     if kind.sender() == role {
+        return Err(Step::Failure {
+            failure: Failure::protocol_violation(),
+            consumed: input.len(),
+        });
+    }
+    if kind == Kind::Withdrawal && !capabilities.contains(&CANCELLATION_CAPABILITY_ID) {
         return Err(Step::Failure {
             failure: Failure::protocol_violation(),
             consumed: input.len(),
@@ -1296,6 +1389,9 @@ enum Correlation {
     Response(ResultCode),
     /// An error frame carrying an assigned class of this scope.
     Error(FailureScope),
+    /// A withdrawal frame naming the request to withdraw. It never enters
+    /// flight at the receiver and retires nothing.
+    Withdrawal,
 }
 
 /// The raw fields of a frame header.
@@ -1380,6 +1476,7 @@ fn correlate(
     code: u16,
     request_id: u64,
     in_flight: &[u64],
+    capabilities: &[u16],
 ) -> Result<Correlation, Failure> {
     match kind {
         Kind::Request => {
@@ -1409,6 +1506,15 @@ fn correlate(
         }
         Kind::Error => {
             let class = ErrorClass::from_wire(code).ok_or_else(Failure::protocol_violation)?;
+            if class == ErrorClass::DeadlineExceeded
+                && !capabilities.contains(&DEADLINES_CAPABILITY_ID)
+            {
+                return Err(Failure::protocol_violation());
+            }
+            if class == ErrorClass::Cancelled && !capabilities.contains(&CANCELLATION_CAPABILITY_ID)
+            {
+                return Err(Failure::protocol_violation());
+            }
             let scope = class.scope();
             if scope == FailureScope::RequestScoped {
                 if request_id == 0 {
@@ -1419,6 +1525,15 @@ fn correlate(
                 }
             }
             Ok(Correlation::Error(scope))
+        }
+        Kind::Withdrawal => {
+            if code != 0 {
+                return Err(Failure::protocol_violation());
+            }
+            if request_id == 0 {
+                return Err(Failure::protocol_violation());
+            }
+            Ok(Correlation::Withdrawal)
         }
     }
 }
@@ -1483,6 +1598,12 @@ fn read_payload(
         Correlation::HandshakeRequest | Correlation::Response(ResultCode::Success) => {
             Ok(Payload::Opaque(payload))
         }
+        Correlation::Withdrawal => {
+            if payload_length != 0 {
+                return Err(Failure::malformed_request());
+            }
+            Ok(Payload::Opaque(payload))
+        }
         Correlation::OperationRequest(opcode) => {
             check_operation_request(opcode, payload_length, payload)
         }
@@ -1522,6 +1643,7 @@ fn read_payload(
 const fn retires_for(kind: Kind, correlation: Correlation, request_id: u64) -> RequestId {
     match kind {
         Kind::Response => RequestId(request_id),
+        Kind::Withdrawal | Kind::Request => RequestId(0),
         Kind::Error => {
             if matches!(correlation, Correlation::Error(FailureScope::RequestScoped)) {
                 RequestId(request_id)
@@ -1529,7 +1651,6 @@ const fn retires_for(kind: Kind, correlation: Correlation, request_id: u64) -> R
                 RequestId(0)
             }
         }
-        Kind::Request => RequestId(0),
     }
 }
 
@@ -1645,6 +1766,25 @@ mod tests {
                 state: ConnectionState::Negotiated,
                 limits: Limits::PRE_NEGOTIATION,
                 in_flight,
+                capabilities: &[],
+            },
+        )
+    }
+
+    fn decode_with<'a>(
+        input: &'a [u8],
+        role: Role,
+        in_flight: &[u64],
+        capabilities: &[u16],
+    ) -> Step<'a> {
+        decode(
+            input,
+            Admission {
+                role,
+                state: ConnectionState::Negotiated,
+                limits: Limits::PRE_NEGOTIATION,
+                in_flight,
+                capabilities,
             },
         )
     }
@@ -1654,13 +1794,19 @@ mod tests {
         assert_eq!(Kind::from_wire(1), Some(Kind::Request));
         assert_eq!(Kind::from_wire(2), Some(Kind::Response));
         assert_eq!(Kind::from_wire(3), Some(Kind::Error));
+        assert_eq!(Kind::from_wire(7), Some(Kind::Withdrawal));
         assert_eq!(Kind::from_wire(0), None);
         assert_eq!(Kind::from_wire(4), None);
+        assert_eq!(Kind::from_wire(8), None);
         assert_eq!(Kind::from_wire(u8::MAX), None);
+        assert_eq!(Kind::Request.value(), 1);
+        assert_eq!(Kind::Withdrawal.value(), 7);
         assert_eq!(Kind::Request.sender(), Role::Client);
+        assert_eq!(Kind::Withdrawal.sender(), Role::Client);
         assert_eq!(Kind::Response.sender(), Role::Server);
         assert_eq!(Kind::Error.sender(), Role::Server);
         assert!(Kind::Response.names_a_request_for_scope(FailureScope::ConnectionFatal));
+        assert!(Kind::Withdrawal.names_a_request_for_scope(FailureScope::RequestScoped));
         assert!(Kind::Error.names_a_request_for_scope(FailureScope::RequestScoped));
         assert!(!Kind::Error.names_a_request_for_scope(FailureScope::ConnectionFatal));
     }
@@ -1709,6 +1855,12 @@ mod tests {
                 0x0005,
                 FailureScope::ConnectionFatal,
             ),
+            (
+                ErrorClass::DeadlineExceeded,
+                0x0006,
+                FailureScope::RequestScoped,
+            ),
+            (ErrorClass::Cancelled, 0x0007, FailureScope::RequestScoped),
             (ErrorClass::Overloaded, 0x0008, FailureScope::RequestScoped),
             (
                 ErrorClass::InternalError,
@@ -1730,21 +1882,14 @@ mod tests {
             assert_eq!(Failure::new(class, scope).scope(), scope);
         }
         assert_eq!(ErrorClass::MalformedRequest.name(), "malformed request");
+        assert_eq!(ErrorClass::DeadlineExceeded.name(), "deadline exceeded");
+        assert_eq!(ErrorClass::Cancelled.name(), "cancelled");
         assert_eq!(
             ErrorClass::UnsupportedOperation.name(),
             "unsupported operation"
         );
         assert_eq!(ErrorClass::WrongType.name(), "wrong type");
-        for value in [
-            0u16,
-            0x0006,
-            0x0007,
-            0x0009,
-            0x000A,
-            0x000D,
-            0x000F,
-            u16::MAX,
-        ] {
+        for value in [0u16, 0x0009, 0x000A, 0x000D, 0x000F, u16::MAX] {
             assert_eq!(ErrorClass::from_wire(value), None);
         }
     }
@@ -2016,7 +2161,7 @@ mod tests {
 
     #[test]
     fn the_five_operation_opcodes_admit() {
-        assert_eq!(SPEC_REVISION, "v0.5.0");
+        assert_eq!(SPEC_REVISION, "v0.6.0");
         for code in [
             PING_OPCODE,
             GET_OPCODE,
@@ -2057,6 +2202,255 @@ mod tests {
                     "opcode {code:#06x} should refuse, got {other:?}"
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_encodes_to_its_exact_bytes() {
+        let outgoing = Outgoing {
+            kind: Kind::Withdrawal,
+            code: 0,
+            request_id: 1,
+            metadata: &[],
+            payload: OutgoingPayload::Opaque(&[]),
+        };
+        let bytes = encode(&outgoing).unwrap_or_default();
+        assert_eq!(bytes, from_hex("0007000000000000000000000100000000000000"));
+    }
+
+    #[test]
+    fn a_withdrawal_admits_and_retires_nothing() {
+        let bytes = from_hex("0007000000000000000000000100000000000000");
+        match decode_with(&bytes, Role::Server, &[], &[CANCELLATION_CAPABILITY_ID]) {
+            Step::Frame(frame) => {
+                assert_eq!(frame.header().kind(), Kind::Withdrawal);
+                assert_eq!(frame.header().code(), 0);
+                assert_eq!(frame.header().request_id().value(), 1);
+                assert_eq!(frame.retires().value(), 0);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected a frame, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_with_a_nonzero_code_is_a_protocol_violation() {
+        let outgoing = Outgoing {
+            kind: Kind::Withdrawal,
+            code: 1,
+            request_id: 1,
+            metadata: &[],
+            payload: OutgoingPayload::Opaque(&[]),
+        };
+        let bytes = encode(&outgoing).unwrap_or_default();
+        match decode_with(&bytes, Role::Server, &[], &[CANCELLATION_CAPABILITY_ID]) {
+            Step::Failure { failure, .. } => {
+                assert_eq!(failure.class(), ErrorClass::ProtocolViolation);
+                assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected failure, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_with_a_payload_or_metadata_is_malformed() {
+        let with_payload = from_hex("000700000000000001000000010000000000000000");
+        match decode_with(
+            &with_payload,
+            Role::Server,
+            &[],
+            &[CANCELLATION_CAPABILITY_ID],
+        ) {
+            Step::Failure { failure, .. } => {
+                assert_eq!(failure.class(), ErrorClass::MalformedRequest);
+                assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected failure, got {other:?}"
+            ),
+        }
+        let outgoing = Outgoing {
+            kind: Kind::Withdrawal,
+            code: 0,
+            request_id: 1,
+            metadata: &[(1, &[0x0a])],
+            payload: OutgoingPayload::Opaque(&[]),
+        };
+        let with_metadata = encode(&outgoing).unwrap_or_default();
+        match decode_with(
+            &with_metadata,
+            Role::Server,
+            &[],
+            &[CANCELLATION_CAPABILITY_ID],
+        ) {
+            Step::Failure { failure, .. } => {
+                assert_eq!(failure.class(), ErrorClass::MalformedRequest);
+                assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected failure, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_naming_the_reserved_id_is_a_protocol_violation() {
+        let bytes = from_hex("0007000000000000000000000000000000000000");
+        match decode_with(&bytes, Role::Server, &[], &[CANCELLATION_CAPABILITY_ID]) {
+            Step::Failure { failure, .. } => {
+                assert_eq!(failure.class(), ErrorClass::ProtocolViolation);
+                assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected failure, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_for_an_unknown_id_admits_without_a_frame() {
+        let bytes = from_hex("0007000000000000000000000300000000000000");
+        match decode_with(&bytes, Role::Server, &[], &[CANCELLATION_CAPABILITY_ID]) {
+            Step::Frame(frame) => {
+                assert_eq!(frame.header().request_id().value(), 3);
+                assert_eq!(frame.retires().value(), 0);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected a frame, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_without_cancellation_is_a_protocol_violation() {
+        let bytes = from_hex("0007000000000000000000000100000000000000");
+        match decode_at(&bytes, Role::Server, &[]) {
+            Step::Failure { failure, .. } => {
+                assert_eq!(failure.class(), ErrorClass::ProtocolViolation);
+                assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected failure, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn gated_error_classes_need_their_capability() {
+        let deadline = from_hex("00030000060000000200000001000000000000000000");
+        match decode_at(&deadline, Role::Client, &[1]) {
+            Step::Failure { failure, .. } => {
+                assert_eq!(failure.class(), ErrorClass::ProtocolViolation);
+                assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected failure, got {other:?}"
+            ),
+        }
+        match decode_with(&deadline, Role::Client, &[1], &[DEADLINES_CAPABILITY_ID]) {
+            Step::Frame(frame) => {
+                assert_eq!(frame.header().code(), 0x0006);
+                assert_eq!(frame.retires().value(), 1);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected a frame, got {other:?}"
+            ),
+        }
+        let cancelled = from_hex("00030000070000000200000001000000000000000000");
+        match decode_at(&cancelled, Role::Client, &[1]) {
+            Step::Failure { failure, .. } => {
+                assert_eq!(failure.class(), ErrorClass::ProtocolViolation);
+                assert_eq!(failure.scope(), FailureScope::ConnectionFatal);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected failure, got {other:?}"
+            ),
+        }
+        match decode_with(
+            &cancelled,
+            Role::Client,
+            &[1],
+            &[CANCELLATION_CAPABILITY_ID],
+        ) {
+            Step::Frame(frame) => {
+                assert_eq!(frame.header().code(), 0x0007);
+                assert_eq!(frame.retires().value(), 1);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected a frame, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_deadline_entry_encodes_to_its_exact_bytes() {
+        let deadline = 10_000u32.to_le_bytes();
+        let outgoing = Outgoing {
+            kind: Kind::Request,
+            code: PING_OPCODE,
+            request_id: 1,
+            metadata: &[(DEADLINE_METADATA_ID, &deadline)],
+            payload: OutgoingPayload::Opaque(&[]),
+        };
+        let bytes = encode(&outgoing).unwrap_or_default();
+        assert_eq!(
+            bytes,
+            from_hex("00010000020008000000000001000000000000000100040010270000")
+        );
+        match decode_with(&bytes, Role::Server, &[], &[DEADLINES_CAPABILITY_ID]) {
+            Step::Frame(frame) => {
+                assert_eq!(frame.metadata().entries().len(), 1);
+                assert_eq!(
+                    frame.metadata().entries().first().map(|e| e.identifier()),
+                    Some(DEADLINE_METADATA_ID)
+                );
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected a frame, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_wrong_length_deadline_entry_still_admits() {
+        let bytes = from_hex("0001000002000600000000000100000000000000010002000a0b");
+        match decode_with(&bytes, Role::Server, &[], &[DEADLINES_CAPABILITY_ID]) {
+            Step::Frame(frame) => {
+                assert_eq!(frame.metadata().entries().len(), 1);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected a frame, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_deadline_entry_without_the_capability_still_admits() {
+        let bytes = from_hex("00010000020008000000000001000000000000000100040010270000");
+        match decode_at(&bytes, Role::Server, &[]) {
+            Step::Frame(frame) => {
+                assert_eq!(frame.metadata().entries().len(), 1);
+            }
+            other => assert!(
+                matches!(other, Step::Need(_)),
+                "expected a frame, got {other:?}"
+            ),
         }
     }
 }

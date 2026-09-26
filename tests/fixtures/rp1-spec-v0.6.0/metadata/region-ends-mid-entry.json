@@ -1,0 +1,17 @@
+{
+  "id": "metadata/region-ends-mid-entry",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Region Fill",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0002000000000600000000000100000000000000010000000200",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "malformed request",
+    "scope": "connection-fatal"
+  }
+}

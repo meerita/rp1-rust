@@ -1,0 +1,17 @@
+{
+  "id": "results/value-held-outside-memory-with-a-short-payload-refused",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Value held outside memory",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "000200000400000007000000010000000000000000000000000000",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "malformed request",
+    "scope": "connection-fatal"
+  }
+}

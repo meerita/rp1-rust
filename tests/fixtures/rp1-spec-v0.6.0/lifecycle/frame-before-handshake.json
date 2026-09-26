@@ -1,0 +1,18 @@
+{
+  "id": "lifecycle/frame-before-handshake",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Before the Handshake",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0001000002000000000000000100000000000000",
+    "role": "server",
+    "state": "pre-negotiation"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

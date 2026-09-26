@@ -1,0 +1,45 @@
+{
+  "id": "errors/cancelled-is-request-scoped",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Cancelled",
+  "direction": "both",
+  "provenance": "derived-from-specification",
+  "input": {
+    "fields": {
+      "version": 0,
+      "kind": 3,
+      "flags": 0,
+      "code": 7,
+      "request_id": "2",
+      "metadata": [],
+      "detail_length": 0,
+      "detail_bytes": "",
+      "text": ""
+    },
+    "role": "client",
+    "in_flight": [
+      "2"
+    ],
+    "capabilities": [
+      2
+    ]
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 3,
+      "flags": 0,
+      "code": 7,
+      "metadata_length": 0,
+      "payload_length": 2,
+      "request_id": "2",
+      "detail_length": 0,
+      "detail_bytes": "",
+      "text": ""
+    },
+    "bytes": "00030000070000000200000002000000000000000000",
+    "bytes_consumed": 22
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "id": "metadata/deadline-without-the-capability-skipped",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Deadlines",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00010000020008000000000001000000000000000100040010270000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "metadata_length": 8,
+      "payload_length": 0,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 1,
+          "value": "10270000"
+        }
+      ]
+    },
+    "bytes_consumed": 28
+  }
+}

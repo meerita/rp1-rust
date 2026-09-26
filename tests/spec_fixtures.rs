@@ -1,32 +1,36 @@
-//! Runs the vendored `rp1-spec` `v0.5.0` fixture corpus against the protocol
+//! Runs the vendored `rp1-spec` fixture corpora against the protocol
 //! codec.
 //!
-//! The corpus is test data. This harness reads every fixture, offers its
-//! input in the declared direction, and asserts the exact outcome the
-//! fixture states.
+//! The corpora are test data. This harness reads every fixture, offers its
+//! input in the declared direction with its declared connection state,
+//! and asserts the exact outcome the fixture states.
 
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rp1db::protocol::{
-    self, Admission, CapabilityEntry, ConnectionState, Frame, HandshakeOffer, HandshakeRequest,
+    self, Admission, CANCELLATION_CAPABILITY_ID, CapabilityEntries, CapabilityEntry,
+    ConnectionState, DEADLINES_CAPABILITY_ID, Frame, HandshakeOffer, HandshakeRequest,
     HandshakeResponse, Kind, Limits, Outgoing, OutgoingPayload, Payload, Role, Step,
 };
 
 /// The protocol versions this implementation supports.
 const SUPPORTED_VERSIONS: &[u16] = &[0];
 
+/// The capability identifiers this implementation offers.
+const OFFERED_CAPABILITIES: &[u16] = &[CANCELLATION_CAPABILITY_ID, DEADLINES_CAPABILITY_ID];
+
 /// The versions and capabilities this implementation offers.
 const OFFER: HandshakeOffer<'_> = HandshakeOffer {
     minimum_protocol_version: 0,
     maximum_protocol_version: 0,
-    capability_ids: &[],
+    capability_ids: OFFERED_CAPABILITIES,
 };
 
-/// Runs every fixture in the vendored corpus.
+/// Runs every fixture in the vendored `v0.5.0` corpus.
 #[test]
-fn corpus_conformance() -> Result<(), Box<dyn Error>> {
+fn corpus_conformance_v0_5_0() -> Result<(), Box<dyn Error>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rp1-spec-v0.5.0");
     let mut files = Vec::new();
     collect_json_files(&root, &mut files)?;
@@ -38,7 +42,28 @@ fn corpus_conformance() -> Result<(), Box<dyn Error>> {
         files.len()
     );
     for file in &files {
-        run_fixture(file)?;
+        run_fixture(file, "v0.5.0")?;
+    }
+    Ok(())
+}
+
+/// Runs every fixture in the vendored `v0.6.0` corpus, including the
+/// request lifetime subset: deadline entries, withdrawal frames, the two
+/// new error classes, and the no-capability cases.
+#[test]
+fn corpus_conformance_v0_6_0() -> Result<(), Box<dyn Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rp1-spec-v0.6.0");
+    let mut files = Vec::new();
+    collect_json_files(&root, &mut files)?;
+    files.sort();
+    assert_eq!(
+        files.len(),
+        132,
+        "expected 132 fixtures, found {}",
+        files.len()
+    );
+    for file in &files {
+        run_fixture(file, "v0.6.0")?;
     }
     Ok(())
 }
@@ -56,8 +81,8 @@ fn collect_json_files(directory: &Path, out: &mut Vec<PathBuf>) -> Result<(), Bo
     Ok(())
 }
 
-/// Loads one fixture and checks its outcome.
-fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
+/// Loads one fixture and checks its outcome against its stated revision.
+fn run_fixture(path: &Path, revision: &str) -> Result<(), Box<dyn Error>> {
     let text = fs::read_to_string(path)?;
     let value = Parser::new(&text).parse()?;
     let id = value
@@ -65,11 +90,11 @@ fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
         .and_then(Json::as_str)
         .ok_or_else(|| format!("{}: missing id", path.display()))?
         .to_string();
-    let revision = value
+    let fixture_revision = value
         .get("revision")
         .and_then(Json::as_str)
         .ok_or_else(|| format!("fixture {id}: missing revision"))?;
-    assert_eq!(revision, "v0.5.0", "fixture {id}: wrong revision");
+    assert_eq!(fixture_revision, revision, "fixture {id}: wrong revision");
     let direction = value
         .get("direction")
         .and_then(Json::as_str)
@@ -83,6 +108,7 @@ fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
     let role = role_of(&id, input)?;
     let state = state_of(&id, input)?;
     let limits = limits_of(&id, input)?;
+    let capabilities = capabilities_of(&id, input)?;
     match direction {
         "decode" => {
             let bytes_hex = input
@@ -92,7 +118,14 @@ fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
             let bytes = hex_decode(bytes_hex)?;
             let in_flight =
                 declared_in_flight(&id, input)?.unwrap_or_else(|| default_in_flight(&bytes));
-            run_decode(&id, &bytes, role, state, limits, &in_flight, expect)?;
+            let admission = Admission {
+                role,
+                state,
+                limits,
+                in_flight: &in_flight,
+                capabilities: &capabilities,
+            };
+            run_decode(&id, &bytes, admission, expect)?;
         }
         "encode" => run_encode(&id, input, expect)?,
         "both" => {
@@ -104,7 +137,14 @@ fn run_fixture(path: &Path) -> Result<(), Box<dyn Error>> {
             let bytes = hex_decode(bytes_hex)?;
             let in_flight =
                 declared_in_flight(&id, input)?.unwrap_or_else(|| default_in_flight(&bytes));
-            run_decode(&id, &bytes, role, state, limits, &in_flight, expect)?;
+            let admission = Admission {
+                role,
+                state,
+                limits,
+                in_flight: &in_flight,
+                capabilities: &capabilities,
+            };
+            run_decode(&id, &bytes, admission, expect)?;
         }
         other => return Err(format!("fixture {id}: unknown direction {other}").into()),
     }
@@ -169,6 +209,27 @@ fn declared_in_flight(id: &str, input: &Json) -> Result<Option<Vec<u64>>, Box<dy
             Ok(Some(out))
         }
         None => Ok(None),
+    }
+}
+
+/// Returns the accepted capability set the fixture offers its bytes under.
+///
+/// A fixture that states no `capabilities` asserts its outcome on a
+/// connection whose accepted set is empty, where every gated behavior is
+/// refused or skipped by the no-capability rule.
+fn capabilities_of(id: &str, input: &Json) -> Result<Vec<u16>, Box<dyn Error>> {
+    match input.get("capabilities") {
+        Some(json) => {
+            let array = json
+                .as_array()
+                .ok_or_else(|| format!("fixture {id}: capabilities must be an array"))?;
+            let mut out = Vec::new();
+            for item in array {
+                out.push(u16::try_from(number(id, "capability", item)?)?);
+            }
+            Ok(out)
+        }
+        None => Ok(Vec::new()),
     }
 }
 
@@ -240,25 +301,14 @@ fn handshake_view<'a>(
 fn run_decode(
     id: &str,
     bytes: &[u8],
-    role: Role,
-    state: ConnectionState,
-    limits: Limits,
-    in_flight: &[u64],
+    admission: Admission<'_>,
     expect: &Json,
 ) -> Result<(), Box<dyn Error>> {
     let outcome = expect
         .get("outcome")
         .and_then(Json::as_str)
         .ok_or_else(|| format!("fixture {id}: missing outcome"))?;
-    let step = protocol::decode(
-        bytes,
-        Admission {
-            role,
-            state,
-            limits,
-            in_flight,
-        },
-    );
+    let step = protocol::decode(bytes, admission);
     match outcome {
         "success" => match step {
             Step::Frame(frame) => {
@@ -276,12 +326,13 @@ fn run_decode(
                         "fixture {id}: retires"
                     );
                 }
-                let view = handshake_view(&frame, role, state).map_err(|failure| {
-                    format!(
-                        "fixture {id}: expected success, got class {}",
-                        failure.class().name()
-                    )
-                })?;
+                let view =
+                    handshake_view(&frame, admission.role, admission.state).map_err(|failure| {
+                        format!(
+                            "fixture {id}: expected success, got class {}",
+                            failure.class().name()
+                        )
+                    })?;
                 let fields = expect
                     .get("fields")
                     .ok_or_else(|| format!("fixture {id}: missing expect.fields"))?;
@@ -292,7 +343,8 @@ fn run_decode(
         "failure" => {
             let (failure, consumed) = match step {
                 Step::Failure { failure, consumed } => (failure, consumed),
-                Step::Frame(frame) => match handshake_view(&frame, role, state) {
+                Step::Frame(frame) => match handshake_view(&frame, admission.role, admission.state)
+                {
                     Err(failure) => (failure, bytes.len()),
                     Ok(_) => {
                         return Err(format!("fixture {id}: expected failure, got a frame").into());
@@ -765,6 +817,8 @@ fn run_encode(id: &str, input: &Json, expect: &Json) -> Result<(), Box<dyn Error
     let payload_bytes = optional_bytes(id, fields.get("payload").and_then(Json::as_str))?;
     let detail_bytes = optional_bytes(id, fields.get("detail_bytes").and_then(Json::as_str))?;
     let text_bytes = optional_bytes(id, fields.get("text").and_then(Json::as_str))?;
+    let handshake_response: Vec<u8>;
+    let handshake_request: Vec<u8>;
     let payload = if fields.get("payload").is_some() {
         OutgoingPayload::Opaque(&payload_bytes)
     } else if let Some(logical_length) = fields.get("logical_length").and_then(Json::as_str) {
@@ -774,6 +828,12 @@ fn run_encode(id: &str, input: &Json, expect: &Json) -> Result<(), Box<dyn Error
             detail: &detail_bytes,
             text: &text_bytes,
         }
+    } else if fields.get("negotiated_protocol_version").is_some() {
+        handshake_response = handshake_response_bytes(id, fields)?;
+        OutgoingPayload::Opaque(&handshake_response)
+    } else if fields.get("client_maximum_protocol_version").is_some() {
+        handshake_request = handshake_request_bytes(id, fields)?;
+        OutgoingPayload::Opaque(&handshake_request)
     } else {
         OutgoingPayload::Opaque(&[])
     };
@@ -799,6 +859,106 @@ fn run_encode(id: &str, input: &Json, expect: &Json) -> Result<(), Box<dyn Error
         "fixture {id}: encoded bytes"
     );
     Ok(())
+}
+
+/// One raw capability entry: its identifier and its value bytes.
+type RawCapabilityEntry = (u16, Vec<u8>);
+
+/// Reads the capability entries of a handshake payload in an encode field set.
+fn encode_capability_entries(
+    id: &str,
+    fields: &Json,
+) -> Result<Vec<RawCapabilityEntry>, Box<dyn Error>> {
+    let Some(entries) = fields.get("capability_entries") else {
+        return Ok(Vec::new());
+    };
+    let array = entries
+        .as_array()
+        .ok_or_else(|| format!("fixture {id}: capability_entries must be an array"))?;
+    let mut out = Vec::new();
+    for entry in array {
+        let capability_id = u16::try_from(number(
+            id,
+            "capability_id",
+            entry
+                .get("capability_id")
+                .ok_or_else(|| format!("fixture {id}: entry missing capability_id"))?,
+        )?)?;
+        let value = entry
+            .get("value")
+            .ok_or_else(|| format!("fixture {id}: entry missing value"))?;
+        out.push((capability_id, hex_decode(string(id, "value", value)?)?));
+    }
+    Ok(out)
+}
+
+/// Encodes the handshake request payload an encode fixture's fields state.
+fn handshake_request_bytes(id: &str, fields: &Json) -> Result<Vec<u8>, Box<dyn Error>> {
+    let maximum = u16::try_from(number(
+        id,
+        "client_maximum_protocol_version",
+        fields
+            .get("client_maximum_protocol_version")
+            .ok_or_else(|| format!("fixture {id}: missing client_maximum_protocol_version"))?,
+    )?)?;
+    let minimum = u16::try_from(number(
+        id,
+        "client_minimum_protocol_version",
+        fields
+            .get("client_minimum_protocol_version")
+            .ok_or_else(|| format!("fixture {id}: missing client_minimum_protocol_version"))?,
+    )?)?;
+    let frame_size = u32::try_from(number(
+        id,
+        "client_desired_maximum_frame_size",
+        fields
+            .get("client_desired_maximum_frame_size")
+            .ok_or_else(|| format!("fixture {id}: missing client_desired_maximum_frame_size"))?,
+    )?)?;
+    let owned = encode_capability_entries(id, fields)?;
+    let refs: Vec<CapabilityEntry<'_>> = owned
+        .iter()
+        .map(|(identifier, value)| CapabilityEntry::new(*identifier, value))
+        .collect();
+    let request = HandshakeRequest::new(maximum, minimum, frame_size, CapabilityEntries::new(refs));
+    Ok(request.encode())
+}
+
+/// Encodes the handshake response payload an encode fixture's fields state.
+fn handshake_response_bytes(id: &str, fields: &Json) -> Result<Vec<u8>, Box<dyn Error>> {
+    let version = u16::try_from(number(
+        id,
+        "negotiated_protocol_version",
+        fields
+            .get("negotiated_protocol_version")
+            .ok_or_else(|| format!("fixture {id}: missing negotiated_protocol_version"))?,
+    )?)?;
+    let frame_size = u32::try_from(number(
+        id,
+        "negotiated_maximum_frame_size",
+        fields
+            .get("negotiated_maximum_frame_size")
+            .ok_or_else(|| format!("fixture {id}: missing negotiated_maximum_frame_size"))?,
+    )?)?;
+    let metadata_size = u16::try_from(number(
+        id,
+        "negotiated_maximum_metadata_size",
+        fields
+            .get("negotiated_maximum_metadata_size")
+            .ok_or_else(|| format!("fixture {id}: missing negotiated_maximum_metadata_size"))?,
+    )?)?;
+    let owned = encode_capability_entries(id, fields)?;
+    let refs: Vec<CapabilityEntry<'_>> = owned
+        .iter()
+        .map(|(identifier, value)| CapabilityEntry::new(*identifier, value))
+        .collect();
+    let response = HandshakeResponse::new(
+        version,
+        frame_size,
+        metadata_size,
+        CapabilityEntries::new(refs),
+    );
+    Ok(response.encode())
 }
 
 /// Decodes a byte string, or returns an empty vector when absent.

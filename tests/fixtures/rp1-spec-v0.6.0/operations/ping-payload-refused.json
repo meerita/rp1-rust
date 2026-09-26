@@ -1,0 +1,17 @@
+{
+  "id": "operations/ping-payload-refused",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Argument Validation",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "000100000200000001000000010000000000000000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "malformed request",
+    "scope": "connection-fatal"
+  }
+}

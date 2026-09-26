@@ -1,0 +1,26 @@
+{
+  "id": "operations/get-response-present",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "GET",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "000200000000000005000000010000000000000076616c7565",
+    "role": "client"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 2,
+      "flags": 0,
+      "code": 0,
+      "metadata_length": 0,
+      "payload_length": 5,
+      "request_id": "1",
+      "value": "76616c7565"
+    },
+    "bytes_consumed": 25
+  }
+}

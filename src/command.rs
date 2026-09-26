@@ -147,7 +147,7 @@ pub fn interpret_ping(frame: &Frame<'_>) -> Result<(), CommandFailure> {
             Ok(())
         }
         Kind::Error => Err(error_of(frame)),
-        Kind::Request => Err(CommandFailure::protocol_violation()),
+        Kind::Request | Kind::Withdrawal => Err(CommandFailure::protocol_violation()),
     }
 }
 
@@ -175,7 +175,7 @@ pub fn interpret_get(frame: &Frame<'_>) -> Result<GetOutcome, CommandFailure> {
             }
         }
         Kind::Error => Err(error_of(frame)),
-        Kind::Request => Err(CommandFailure::protocol_violation()),
+        Kind::Request | Kind::Withdrawal => Err(CommandFailure::protocol_violation()),
     }
 }
 
@@ -193,7 +193,7 @@ pub fn interpret_set(frame: &Frame<'_>) -> Result<(), CommandFailure> {
             Ok(())
         }
         Kind::Error => Err(error_of(frame)),
-        Kind::Request => Err(CommandFailure::protocol_violation()),
+        Kind::Request | Kind::Withdrawal => Err(CommandFailure::protocol_violation()),
     }
 }
 
@@ -213,7 +213,7 @@ pub fn interpret_del(frame: &Frame<'_>) -> Result<bool, CommandFailure> {
             }
         }
         Kind::Error => Err(error_of(frame)),
-        Kind::Request => Err(CommandFailure::protocol_violation()),
+        Kind::Request | Kind::Withdrawal => Err(CommandFailure::protocol_violation()),
     }
 }
 
@@ -287,6 +287,7 @@ mod tests {
                 state: ConnectionState::Negotiated,
                 limits: Limits::PRE_NEGOTIATION,
                 in_flight,
+                capabilities: &[],
             },
         )
     }

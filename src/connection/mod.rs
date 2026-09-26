@@ -17,8 +17,9 @@ use driver::{DriverError, Submit};
 
 use crate::command;
 use crate::protocol::{
-    self, Admission, CapabilityEntries, ErrorClass, Failure, FailureScope, HANDSHAKE_OPCODE,
-    HandshakeOffer, HandshakeRequest, HandshakeResponse, Kind, Limits, MAX_FRAME_SIZE,
+    self, Admission, CANCELLATION_CAPABILITY_ID, CapabilityEntries, CapabilityEntry,
+    DEADLINES_CAPABILITY_ID, ErrorClass, Failure, FailureScope, HANDSHAKE_OPCODE, HandshakeOffer,
+    HandshakeRequest, HandshakeResponse, Kind, Limits, MAX_FRAME_SIZE,
     MINIMUM_NEGOTIATED_FRAME_SIZE, MINIMUM_NEGOTIATED_METADATA_SIZE, Outgoing, OutgoingPayload,
     Payload, Role, Step,
 };
@@ -30,11 +31,14 @@ const HANDSHAKE_REQUEST_ID: u64 = 1;
 /// The most bytes one read may move while the handshake is in progress.
 const READ_CHUNK: usize = 4_096;
 
+/// The capability identifiers this implementation offers.
+const OFFERED_CAPABILITIES: &[u16] = &[CANCELLATION_CAPABILITY_ID, DEADLINES_CAPABILITY_ID];
+
 /// The versions and capabilities this implementation offers.
 const OFFER: HandshakeOffer<'_> = HandshakeOffer {
     minimum_protocol_version: 0,
     maximum_protocol_version: 0,
-    capability_ids: &[],
+    capability_ids: OFFERED_CAPABILITIES,
 };
 
 /// The desired maximum frame size a configuration proposes by default.
@@ -393,6 +397,14 @@ pub enum CommandError {
     InvalidArgument,
     /// The responder could not admit the resources the request needs.
     Overloaded,
+    /// The request carried a deadline whose duration had passed before the
+    /// responder began the work it names. The responder performed no work
+    /// for the request: a mutation was not applied.
+    DeadlineExceeded,
+    /// The request was withdrawn before it committed. The responder
+    /// performed no work for the request: a mutation was not applied, and
+    /// no committed mutation is rolled back.
+    Cancelled,
     /// The key is held in a representation the operation does not act on.
     WrongType,
     /// The responder met a condition it did not anticipate.
@@ -427,6 +439,8 @@ impl fmt::Display for CommandError {
             Self::UnsupportedOperation => formatter.write_str("unsupported operation"),
             Self::InvalidArgument => formatter.write_str("invalid argument"),
             Self::Overloaded => formatter.write_str("overloaded"),
+            Self::DeadlineExceeded => formatter.write_str("deadline exceeded"),
+            Self::Cancelled => formatter.write_str("cancelled"),
             Self::WrongType => formatter.write_str("wrong type"),
             Self::InternalError => formatter
                 .write_str("internal error: the mutation may have taken effect; re-read to decide"),
@@ -456,6 +470,8 @@ impl CommandError {
     /// Only the internal error class is ambiguous at this revision;
     /// transport, close, and unusable outcomes are also reported as
     /// ambiguous because no terminal response establishes completion.
+    /// `DeadlineExceeded` and `Cancelled` are not ambiguous: the responder
+    /// performed no work for the request.
     #[must_use]
     pub const fn is_ambiguous(&self) -> bool {
         matches!(
@@ -471,6 +487,8 @@ impl CommandError {
             Self::UnsupportedOperation
             | Self::InvalidArgument
             | Self::Overloaded
+            | Self::DeadlineExceeded
+            | Self::Cancelled
             | Self::WrongType
             | Self::InternalError => Some(FailureScope::RequestScoped),
             Self::ProtocolViolation
@@ -488,6 +506,8 @@ impl CommandError {
             ErrorClass::UnsupportedOperation => Self::UnsupportedOperation,
             ErrorClass::InvalidArgument => Self::InvalidArgument,
             ErrorClass::ResourceLimit => Self::ResourceLimit,
+            ErrorClass::DeadlineExceeded => Self::DeadlineExceeded,
+            ErrorClass::Cancelled => Self::Cancelled,
             ErrorClass::Overloaded => Self::Overloaded,
             ErrorClass::InternalError => Self::InternalError,
             ErrorClass::ProtocolViolation => Self::ProtocolViolation,
@@ -703,6 +723,7 @@ impl Connection {
             let (submit_tx, driver_handle) = driver::spawn(
                 transport,
                 limits,
+                negotiated.accepted_capabilities.clone(),
                 Arc::clone(&state),
                 Arc::clone(&admission),
                 shutdown_rx,
@@ -1091,6 +1112,7 @@ impl Connection {
                 metadata_size: self.effective_maximum_metadata_size(),
             },
             in_flight: &in_flight,
+            capabilities: &self.shared.negotiated.accepted_capabilities,
         };
         match protocol::decode(frame_bytes, admission) {
             Step::Frame(frame) => Ok(frame),
@@ -1322,7 +1344,10 @@ fn build_handshake_request(
         0,
         0,
         config.desired_maximum_frame_size_value(),
-        CapabilityEntries::new(Vec::new()),
+        CapabilityEntries::new(vec![
+            CapabilityEntry::new(CANCELLATION_CAPABILITY_ID, &[]),
+            CapabilityEntry::new(DEADLINES_CAPABILITY_ID, &[]),
+        ]),
     );
     let payload = request.encode();
     let outgoing = Outgoing {
@@ -1378,6 +1403,7 @@ async fn read_handshake_response(
             state: protocol::ConnectionState::PreNegotiation,
             limits: Limits::PRE_NEGOTIATION,
             in_flight: std::slice::from_ref(&handshake_id),
+            capabilities: &[],
         };
         match protocol::decode(&buffer, admission) {
             Step::Frame(frame) => return interpret_response(&frame, config),
@@ -1423,6 +1449,7 @@ fn interpret_response(
                     .accepted_capability_entries()
                     .entries()
                     .iter()
+                    .filter(|entry| entry.value().is_empty())
                     .map(|entry| entry.identifier())
                     .collect(),
                 local_maximum_frame_size: config.local_maximum_frame_size_value(),

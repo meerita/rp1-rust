@@ -1,0 +1,18 @@
+{
+  "id": "handshake/acceptance-names-unoffered-capability",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Offering and Acceptance",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "00020000000000000e00000001000000000000000000000001000010010001000000",
+    "role": "client",
+    "state": "pre-negotiation"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "protocol violation",
+    "scope": "connection-fatal"
+  }
+}

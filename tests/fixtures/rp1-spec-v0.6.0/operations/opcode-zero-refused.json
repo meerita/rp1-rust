@@ -1,0 +1,18 @@
+{
+  "id": "operations/opcode-zero-refused",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Opcodes",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "0001000000000000000000000100000000000000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "failure",
+    "class": "unsupported operation",
+    "scope": "request-scoped",
+    "bytes_consumed": 20
+  }
+}

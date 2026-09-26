@@ -1,0 +1,26 @@
+{
+  "id": "operations/key-containing-a-nul-byte",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "The key and the value",
+  "direction": "decode",
+  "provenance": "derived-from-specification",
+  "input": {
+    "bytes": "000100000300000001000000010000000000000000",
+    "role": "server"
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 3,
+      "metadata_length": 0,
+      "payload_length": 1,
+      "request_id": "1",
+      "key": "00"
+    },
+    "bytes_consumed": 21
+  }
+}

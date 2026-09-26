@@ -1,0 +1,48 @@
+{
+  "id": "metadata/deadline-absent-versus-zero",
+  "revision": "v0.6.0",
+  "protocol_version": 0,
+  "clause": "Absence and Zero",
+  "direction": "both",
+  "provenance": "derived-from-specification",
+  "input": {
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 1,
+          "value": "00000000"
+        }
+      ],
+      "payload": ""
+    },
+    "role": "server",
+    "capabilities": [
+      4
+    ]
+  },
+  "expect": {
+    "outcome": "success",
+    "fields": {
+      "version": 0,
+      "kind": 1,
+      "flags": 0,
+      "code": 2,
+      "metadata_length": 8,
+      "payload_length": 0,
+      "request_id": "1",
+      "metadata": [
+        {
+          "identifier": 1,
+          "value": "00000000"
+        }
+      ]
+    },
+    "bytes": "00010000020008000000000001000000000000000100040000000000",
+    "bytes_consumed": 28
+  }
+}

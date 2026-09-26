@@ -38,6 +38,7 @@ fn decode_at<'a>(bytes: &'a [u8], role: Role, in_flight: &[u64]) -> Step<'a> {
             state: protocol::ConnectionState::Negotiated,
             limits: protocol::Limits::PRE_NEGOTIATION,
             in_flight,
+            capabilities: &[],
         },
     )
 }
