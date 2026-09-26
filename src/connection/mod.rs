@@ -385,6 +385,9 @@ pub enum CommandError {
     /// The request could not be represented on the wire.
     InvalidRequest,
     /// The responder does not serve the named operation.
+    ///
+    /// Servers at earlier revisions answer each command this way while
+    /// the session keeps serving.
     UnsupportedOperation,
     /// The responder parsed the request and rejects a value it carries.
     InvalidArgument,
@@ -567,6 +570,18 @@ impl ConnectionState {
 /// A `Connection` is returned only after the handshake completes. It owns
 /// its negotiated session state and carries multiplexed requests with
 /// bounded admission. Clones share one session.
+///
+/// ```no_run
+/// use rp1db::{Connection, ConnectionConfig};
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let connection = Connection::connect(&ConnectionConfig::new("127.0.0.1:6390")).await?;
+/// connection.set(b"hello", b"world").await?;
+/// assert!(connection.exists(b"hello").await?);
+/// connection.close().await?;
+/// # Ok(())
+/// # }
+/// ```
 ///
 /// A clone is another handle to the same session, never a new connection.
 /// Clones share admission, request identity, negotiated state, and
